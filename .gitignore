@@ -24,3 +24,7 @@ doc/build/
 # Hidden files
 .*
 !.devcontainer
+
+# lu_inv bench outputs and generated kernel headers
+bench/luinv/results/
+bench/luinv/variants/*/include/**/generated/
