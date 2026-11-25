@@ -9,6 +9,9 @@ from bench.luinv.problem import PRECISIONS
 from bench.luinv.variants import names
 
 
+RESULTS = Path(__file__).parent / 'results'
+
+
 def _case_args(ap):
     ap.add_argument('--variant', default='baseline', choices=names())
     ap.add_argument('--n', type=int, default=320)
@@ -116,11 +119,125 @@ def _add_case_commands(sub):
     ap.set_defaults(func=cmd_bench, reps=1, warmup=0, no_verify=True)
 
 
+# Sweeps, comparisons and library references
+
+def _ints(s):
+    return [int(v) for v in s.split(',')]
+
+
+def _strs(s):
+    return s.split(',')
+
+
+def _refs(n, neles, precision, reps):
+    import numpy as np
+
+    from bench.luinv.problem import make_backend
+    from bench.luinv.refs import References
+
+    refs = References(make_backend('hip'))
+    dtype = np.float64 if precision == 'double' else np.float32
+    nbytes = neles*n*n*np.dtype(dtype).itemsize
+
+    return [refs.rocsolver(n, neles, dtype, reps=reps),
+            refs.gemm(n, neles, dtype, reps=reps),
+            refs.copy(nbytes, reps=reps)]
+
+
+def cmd_refs(args):
+    for res in _refs(args.n, args.neles, args.precision, args.reps):
+        if 'tflops' in res:
+            print(f"{res['ref']}: n {res['n']} x {res['neles']} "
+                  f"{res['dtype']}  median {res['median_s']*1e3:.3f} ms  "
+                  f"{res['tflops']:.2f} TFLOP/s (2n^3)")
+        else:
+            print(f"{res['ref']}: {res['nbytes']/1e6:.0f} MB  median "
+                  f"{res['median_s']*1e3:.3f} ms  {res['gbs']:.0f} GB/s")
+        _emit(res, args.out)
+
+
+def cmd_sweep(args):
+    import itertools as it
+
+    out = args.out or RESULTS / 'sweep.jsonl'
+    grid = it.product(_ints(args.n), _strs(args.precision),
+                      _ints(args.neles), _strs(args.variant))
+
+    for n, prec, neles, variant in grid:
+        case = harness.Case(n=n, neles=neles, ncolours=args.ncolours,
+                            precision=prec, kind=args.kind,
+                            variant=variant, backend=args.backend,
+                            memory_model=args.memory_model)
+        try:
+            res = harness.run_bench(case, reps=args.reps)
+        except (NotImplementedError, RuntimeError) as e:
+            print(f'{case.label()}: skipped ({e})')
+            continue
+
+        rb, chk = res['rebuild'], res['check']
+        print(f"{case.label()}: {rb['median_s']*1e3:.3f} ms  "
+              f"{rb['nominal_tflops']:.2f} TFLOP/s  "
+              f"check {'PASS' if chk['passed'] else 'FAIL'}")
+        _emit(res, out)
+
+    # Library references at each size, once per precision
+    if args.refs:
+        for n, prec, neles in it.product(_ints(args.n), _strs(args.precision),
+                                         _ints(args.neles)):
+            if prec in ('double', 'single'):
+                for res in _refs(n, neles, prec, args.reps):
+                    _emit(res, out)
+
+    print(f'Results appended to {out}')
+
+
+def cmd_compare(args):
+    from bench.luinv.report import compare, load
+
+    print(compare(load(args.files), ref=args.ref))
+
+
+def _add_benchmark_commands(sub):
+    ap = sub.add_parser('sweep', help='benchmark a grid of cases')
+    ap.add_argument('--variant', default='baseline',
+                    help='comma separated variants')
+    ap.add_argument('--n', default='175,320,625')
+    ap.add_argument('--precision', default='double,single')
+    ap.add_argument('--neles', default='512,4096')
+    ap.add_argument('--ncolours', type=int, default=1)
+    ap.add_argument('--kind', default='jacobian', choices=KINDS)
+    ap.add_argument('--backend', default='hip')
+    ap.add_argument('--memory-model', default='normal',
+                    choices=['normal', 'large'])
+    ap.add_argument('--reps', type=int, default=10)
+    ap.add_argument('--refs', action='store_true',
+                    help='also time the library references')
+    ap.add_argument('--out', type=Path)
+    ap.set_defaults(func=cmd_sweep)
+
+    ap = sub.add_parser('compare', help='tabulate benchmark results')
+    ap.add_argument('files', nargs='+', type=Path)
+    ap.add_argument('--ref', default='baseline',
+                    help='variant to compute speedups against')
+    ap.set_defaults(func=cmd_compare)
+
+    ap = sub.add_parser('refs', help='time rocSOLVER, GEMM and copy '
+                        'references')
+    ap.add_argument('--n', type=int, default=320)
+    ap.add_argument('--neles', type=int, default=512)
+    ap.add_argument('--precision', default='double',
+                    choices=['double', 'single'])
+    ap.add_argument('--reps', type=int, default=20)
+    ap.add_argument('--out', type=Path)
+    ap.set_defaults(func=cmd_refs)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m bench.luinv')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     _add_case_commands(sub)
+    _add_benchmark_commands(sub)
 
     args = ap.parse_args(argv)
     return args.func(args)
