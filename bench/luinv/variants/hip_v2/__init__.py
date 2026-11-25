@@ -13,6 +13,9 @@ solves.  Options (environment variables, overriding the size policy):
   LUINV_K2_MINBLK=<n> the same for the solve kernel only
   LUINV_PIVOT=<mode>  pivot arg-max: shfl (default) or lds (the baseline)
   LUINV_IX32=0|1      hoist the int64 workspace base out of the indices
+  LUINV_K2=<kind>     solves: mfma (hand written, the default where it
+                      applies: fp64 with npad a multiple of 16) or gen
+  LUINV_WPB=<n>       waves per block of the mfma solves
 """
 from functools import cached_property
 from pathlib import Path
@@ -31,6 +34,7 @@ GENERATED = INCLUDE / 'luinv' / 'hip_v2' / 'generated'
 TEMPLATE = 'bench.luinv.variants.baseline.lu_inv_baseline'
 
 FACTOR, SOLVE = 'lu_factor_hip_v2', 'lu_solve_hip_v2'
+PACK, SOLVE_MFMA = 'lu_pack_hip_v2', 'lu_solve_mfma_hip_v2'
 
 
 def nchunk(tplargs):
@@ -53,6 +57,18 @@ def options(tplargs):
         opts['pivot'] = env['LUINV_PIVOT']
     if 'LUINV_IX32' in env:
         opts['ix32'] = env['LUINV_IX32'] not in ('', '0')
+
+    # The MFMA solves take fp64 in 16 x 16 tiles
+    nb, mfma = tplargs['npad'] // 16, tplargs['npad'] % 16 == 0
+    mfma &= tplargs['ftype'] == tplargs['otype'] == 'double'
+    opts['k2'] = env.get('LUINV_K2', 'mfma' if mfma else 'gen')
+    if opts['k2'] == 'mfma':
+        wpb = next(w for w in (4, 2, 1) if nb % w == 0)
+        opts['wpb'] = int(env.get('LUINV_WPB', wpb))
+
+        # Two waves per SIMD while the tiles of Z fit in half the registers
+        opts['k2minblk'] = int(env.get('LUINV_K2_MINBLK',
+                                       2 if nb <= 20 else 1))
 
     return opts
 
@@ -147,8 +163,9 @@ class LUInverse(BaselineLUInverse):
     def _tplargs(self, m, out):
         t = super()._tplargs(m, out)
 
-        # The factor, then a right-hand side area for each column chunk
-        t['wsz'] = t['npad']*(t['npad'] + nchunk(t)*t['sc'])
+        # The factor, then a right-hand side area for each column chunk or
+        # the packed factor and inverses of the diagonal blocks of U
+        t['wsz'] = t['npad']*(t['npad'] + nchunk(t)*t['sc'] + 16)
         return t
 
     @cached_property
@@ -157,9 +174,20 @@ class LUInverse(BaselineLUInverse):
 
     @cached_property
     def module(self):
-        hdr = generate(self.backend, self.tplargs, self.opts)
+        t, opts, out = self.tplargs, self.opts, self.out
+        hdr = generate(self.backend, t, opts)
+
+        defs = {'LUINV_HEADER': hdr.name}
+        if opts['k2'] == 'mfma':
+            defs |= {
+                'LUINV_MFMA': 1, 'LUINV_N': t['n'], 'LUINV_NP': t['npad'],
+                'LUINV_WSZ': f"{t['wsz']}LL", 'LUINV_WPB': opts['wpb'],
+                'LUINV_K2MB': opts['k2minblk'], 'LUINV_TR': out.trows,
+                'LUINV_TC': out.tcols, 'LUINV_PADC': out.padc
+            }
+
         return RawHIPModule(self.backend, HERE / 'lu_inv.hip', INCLUDE,
-                            defines={'LUINV_HEADER': hdr.name})
+                            defines=defs)
 
     @cached_property
     def kerns(self):
@@ -169,17 +197,38 @@ class LUInverse(BaselineLUInverse):
         block = (self.tplargs['nthreads'], 1, 1)
         nc = nchunk(self.tplargs)
 
-        # A pair of kernels for each number of items inverted at once
-        sizes = {v.n for ps in self.parts.values() for _, v in ps}
-        return {s: (self.module.kernel(FACTOR, argt, (s, 1, 1), block),
-                    self.module.kernel(SOLVE, argt, (s*nc, 1, 1), block))
-                for s in sizes}
+        mod, sizes = self.module, {v.n for ps in self.parts.values()
+                                   for _, v in ps}
+
+        # The kernels for each number of items inverted at once
+        kerns = {}
+        for s in sizes:
+            ks = [mod.kernel(FACTOR, argt, (s, 1, 1), block)]
+            if self.opts['k2'] == 'mfma':
+                nb, wpb = self.tplargs['npad'] // 16, self.opts['wpb']
+                ks.append(mod.kernel(PACK, [b.ixdtype, PTR, PTR],
+                                     (s*nb, 1, 1), (256, 1, 1)))
+                ks.append(mod.kernel(SOLVE_MFMA, [b.ixdtype] + [PTR]*5,
+                                     (s*nb // wpb, 1, 1), (64*wpb, 1, 1)))
+            else:
+                ks.append(mod.kernel(SOLVE, argt, (s*nc, 1, 1), block))
+
+            kerns[s] = ks
+
+        return kerns
 
     def invert(self, key, scale):
         for src, inv in self.parts[key]:
+            ks = self.kerns[inv.n]
             args = (inv.n, scale, *inv.kargs('v'), self.perm,
                     *src.kargs('ml'), self.wk, self.ws)
-            for kern in self.kerns[inv.n]:
-                kern.set_args(*args)
+            ks[0].set_args(*args)
 
-            self.backend.run_kernels(self.kerns[inv.n])
+            if self.opts['k2'] == 'mfma':
+                ks[1].set_args(inv.n, self.wk, self.ws)
+                ks[2].set_args(inv.n, *inv.kargs('v'), self.perm, self.wk,
+                               self.ws)
+            else:
+                ks[1].set_args(*args)
+
+            self.backend.run_kernels(ks)
