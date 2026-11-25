@@ -202,14 +202,16 @@ __device__ __forceinline__ void block_sync()
 // left row major in the strip, a row per lane and pass.  For each column the
 // waves reduce the pivot search by DPP moves and post their best candidate
 // row in LDS, so after one barrier every lane picks the pivot row and reads
-// it from there.  Then apply the row interchanges to the factored strips and
-// the row order rord, store the blocks of L below the diagonal packed and
-// stage the diagonal block in dg.  Kept out of line, as its registers are
+// it from there.  Then apply the row interchanges to the factored strips,
+// the npend strips after k waiting row major and the row order rord, store
+// the blocks of L below the diagonal packed and stage the diagonal block in
+// dg.  Kept out of line, as its registers are
 // separate from those of the updates.
 template<int NP, int W>
 __device__ __noinline__ void factor_panel(
-    double* a, int k, short* rord, int* ipiv, double (*cand)[W][16],
-    double (*grow)[16], unsigned long long (*ckey)[W], double* dg)
+    double* a, int k, int npend, short* rord, int* ipiv,
+    double (*cand)[W][16], double (*grow)[16], unsigned long long (*ckey)[W],
+    double* dg)
 {
     constexpr int NB = NP/16, NL = 64*W, NQ = (NP + NL - 1)/NL;
 
@@ -339,6 +341,13 @@ __device__ __noinline__ void factor_panel(
             sb[ig] = sb[im];
             sb[im] = t;
         }
+        for (int e = tid; e < 16*npend; e += NL)
+        {
+            double* sb = a + 256*NB*(k + 1 + e / 16) + e % 16;
+            double t = sb[16*gk];
+            sb[16*gk] = sb[16*mi];
+            sb[16*mi] = t;
+        }
         if (tid == 0)
         {
             short t = rord[gk];
@@ -368,18 +377,20 @@ __device__ __noinline__ void factor_panel(
     }
 }
 
-// Factorise one matrix per block of W waves.
+// Factorise one matrix per block of W waves, S strips per pass.
 //
-// The waves deal the block rows of a strip between them: wave w holds block
-// rows jb + w, jb + w + W, ... as tiles 0, 1, ..., with jb advancing by W
-// as the leading tiles are solved.  For each step i of the updates the
-// owner of block row i has published the solved Z_i through LDS; every wave
-// then subtracts L_ji Z_i from its block rows below, the owner of block row
-// i + 1 first, solving and publishing it for the next step, so each step
-// takes one barrier.
+// The waves deal the block rows of the strips between them: wave w holds
+// block rows jb + w, jb + w + W, ... as tiles 0, 1, ..., with jb advancing
+// by W as the leading tiles are solved.  For each step i of the updates
+// the owner of block row i has published the solved Z_i through LDS; every
+// wave then subtracts L_ji Z_i from its block rows below, the owner of
+// block row i + 1 first, solving and publishing it for the next step, so
+// each step takes one barrier.  A pass first applies the strips factored
+// before it to all its strips at once, each operand serving all of them,
+// then factorises its strips in turn, applying those of the pass before.
 //
 // The panel is spread over all the lanes too; see factor_panel.
-template<int NP, long long WSZ, int W, typename IX>
+template<int NP, long long WSZ, int W, int S, typename IX>
 __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                                           double* __restrict__ ws_v,
                                           short* __restrict__ perm_v,
@@ -389,11 +400,10 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
     long long ph[9] = {}, t0 = clock64();
 #endif
     constexpr int NB = NP/16, NT = (NB + W - 1)/W, NL = 64*W;
-    constexpr int NQ = (NP + NL - 1)/NL;
 
     __shared__ short rord[NP];
     __shared__ double dg[256], idg[16];
-    __shared__ f64x4 zb[2][64];
+    __shared__ f64x4 zb[2][S][64];
     __shared__ double cand[2][W][16], grow[2][16];
     __shared__ unsigned long long ckey[2][W];
     __shared__ int ipiv[16];
@@ -409,29 +419,16 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
         rord[r] = r;
     __syncthreads();
 
-    for (int k = 0; k < NB; k++)
+    for (int k0 = 0; k0 < NB; k0 += S)
     {
-        double* s = a + 256*NB*k;
-        const int r0 = 16*k;
+        const int ns = min(S, NB - k0);
 
-        // Load the block rows of this wave in the current row order
-        f64x4 z[NT];
-#pragma unroll
-        for (int t = 0; t < NT; t++)
-        {
-            int j = w + W*t;
-            if (j < NB)
-            {
-#pragma unroll
-                for (int v = 0; v < 4; v++)
-                {
-                    int r = rord[16*j + mfma_crow(lane, v)];
-                    z[t][v] = s[16*r + mfma_lrow(lane)];
-                }
-            }
-        }
-
-        LUINV_TICK(0);
+        // The nsa strips from kb held as tiles, with the updates solving
+        // their block rows i0 to ke - 1
+        f64x4 z[S][NT];
+        int kb, nsa, i0, ke;
+        auto strip = [&](int s) { return a + 256*NB*(kb + s); };
+        auto held = [&](int s) { return S == 1 || s < nsa; };
 
         // The operands of step i of the updates for the tiles, numbered
         // from block row jb, and of the solve of block row i + 1
@@ -445,27 +442,11 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                 if (j > i && j < NB)
                     pa[t] = load_a(a + pk_block<NB>(j, i), lane);
             }
-            if (i + 1 < k && w == (i + 1) % W)
+            if (i + 1 < ke && w == (i + 1 - i0) % W)
                 pd = load_a(a + pk_block<NB>(i + 1, i + 1), lane);
         };
 
-        // Solve and publish block row 0, storing it as U_0k
-        if (k > 0)
-        {
-            fetch(0, 0);
-            if (w == 0)
-            {
-                z[0] = block_mma<false>(a + pk_block<NB>(0, 0), lane, z[0],
-                                        zero);
-                zb[0][lane] = z[0];
-#pragma unroll
-                for (int v = 0; v < 4; v++)
-                    s[pk_ix(mfma_crow(lane, v), mfma_lrow(lane))] = z[0][v];
-            }
-        }
-        __syncthreads();
-
-        // Steps ib to ib + W - 1 of the updates, those before k, each
+        // Steps ib to ib + W - 1 of the updates, those before ke, each
         // fetching the operands of the next
         auto steps = [&](int ib)
         {
@@ -473,11 +454,15 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
             for (int u = 0; u < W; u++)
             {
                 const int i = ib + u;
-                if (i >= k)
+                if (i >= ke)
                     break;
 
-                const f64x4 zi = zb[u % 2][lane];
-                const bool next = i + 1 < k;
+                f64x4 zi[S];
+#pragma unroll
+                for (int s = 0; s < S; s++)
+                    if (held(s))
+                        zi[s] = zb[u % 2][s][lane];
+                const bool next = i + 1 < ke;
 
                 f64x4 ca[NT], cd = pd;
 #pragma unroll
@@ -490,14 +475,22 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                 const int on = (u + 1) % W, tn = (u + 1) / W;
                 if (next && w == on)
                 {
-                    f64x4 zn = mma_a<true>(ca[tn], zi, z[tn]);
-                    zn = mma_a<false>(cd, zn, zero);
-                    z[tn] = zn;
-                    zb[(u + 1) % 2][lane] = zn;
 #pragma unroll
-                    for (int v = 0; v < 4; v++)
-                        s[256*(i + 1) + pk_ix(mfma_crow(lane, v),
-                                              mfma_lrow(lane))] = zn[v];
+                    for (int s = 0; s < S; s++)
+                    {
+                        if (held(s))
+                        {
+                            f64x4 zn = mma_a<true>(ca[tn], zi[s], z[s][tn]);
+                            zn = mma_a<false>(cd, zn, zero);
+                            z[s][tn] = zn;
+                            zb[(u + 1) % 2][s][lane] = zn;
+#pragma unroll
+                            for (int v = 0; v < 4; v++)
+                                strip(s)[256*(i + 1)
+                                         + pk_ix(mfma_crow(lane, v),
+                                                 mfma_lrow(lane))] = zn[v];
+                        }
+                    }
                 }
 
                 // Update the other block rows below
@@ -506,58 +499,161 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                 {
                     int j = ib + w + W*t;
                     if (j > i + next && j < NB)
-                        z[t] = mma_a<true>(ca[t], zi, z[t]);
+                    {
+#pragma unroll
+                        for (int s = 0; s < S; s++)
+                            if (held(s))
+                                z[s][t] = mma_a<true>(ca[t], zi[s], z[s][t]);
+                    }
                 }
                 __syncthreads();
             }
         };
 
-        // Whole groups of steps, after which the leading tiles are solved
-        int jb = 0;
-        for (; jb + W <= k; jb += W)
+        // Run the updates from block row i0, the tiles numbered from it,
+        // returning the block row the tiles are then numbered from
+        auto run = [&]()
         {
-            steps(jb);
+            // Solve and publish block row i0, storing it as U
+            if (i0 < ke)
+            {
+                fetch(i0, i0);
+                if (w == 0)
+                {
+                    const f64x4 d = load_a(a + pk_block<NB>(i0, i0), lane);
+#pragma unroll
+                    for (int s = 0; s < S; s++)
+                    {
+                        if (held(s))
+                        {
+                            z[s][0] = mma_a<false>(d, z[s][0], zero);
+                            zb[0][s][lane] = z[s][0];
+#pragma unroll
+                            for (int v = 0; v < 4; v++)
+                                strip(s)[256*i0
+                                         + pk_ix(mfma_crow(lane, v),
+                                                 mfma_lrow(lane))] =
+                                    z[s][0][v];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+
+            // Whole groups of steps, after which the leading tiles are
+            // solved
+            int jb = i0;
+            for (; jb + W <= ke; jb += W)
+            {
+                steps(jb);
 
 #pragma unroll
-            for (int t = 0; t < NT - 1; t++)
-                z[t] = z[t + 1];
+                for (int s = 0; s < S; s++)
+                {
+#pragma unroll
+                    for (int t = 0; t < NT - 1; t++)
+                        z[s][t] = z[s][t + 1];
+                }
+            }
+            if (jb < ke)
+                steps(jb);
+
+            return jb;
+        };
+
+        // Store the block rows from ke of the strips row major
+        auto store_rest = [&](int jb)
+        {
+#pragma unroll
+            for (int s = 0; s < S; s++)
+            {
+#pragma unroll
+                for (int t = 0; t < NT; t++)
+                {
+                    int j = jb + w + W*t;
+                    if (held(s) && j >= ke && j < NB)
+                    {
+#pragma unroll
+                        for (int v = 0; v < 4; v++)
+                            strip(s)[256*j + 16*mfma_crow(lane, v)
+                                     + mfma_lrow(lane)] = z[s][t][v];
+                    }
+                }
+            }
+            block_sync();
+        };
+
+        // Load the strips of the pass in the current row order, apply the
+        // strips before it and leave the rest of their rows row major
+        kb = k0, nsa = ns, i0 = 0, ke = k0;
+#pragma unroll
+        for (int s = 0; s < S; s++)
+        {
+#pragma unroll
+            for (int t = 0; t < NT; t++)
+            {
+                int j = w + W*t;
+                if (held(s) && j < NB)
+                {
+#pragma unroll
+                    for (int v = 0; v < 4; v++)
+                    {
+                        int r = rord[16*j + mfma_crow(lane, v)];
+                        z[s][t][v] = strip(s)[16*r + mfma_lrow(lane)];
+                    }
+                }
+            }
         }
-        if (jb < k)
-            steps(jb);
+
+        LUINV_TICK(0);
+
+        store_rest(run());
 
         LUINV_TICK(1);
 
-        // Store the rest of the strip row major to pick it up a row a lane
-#pragma unroll
-        for (int t = 0; t < NT; t++)
+        for (int s = 0; s < ns; s++)
         {
-            int j = jb + w + W*t;
-            if (j >= k && j < NB)
+            const int k = k0 + s;
+
+            // Apply the strips of the pass before this one, which have
+            // swapped its rows as they were factorised
+            if (S > 1 && s > 0)
             {
+                kb = k, nsa = 1, i0 = k0, ke = k;
 #pragma unroll
-                for (int v = 0; v < 4; v++)
-                    s[256*j + 16*mfma_crow(lane, v) + mfma_lrow(lane)] =
-                        z[t][v];
+                for (int t = 0; t < NT; t++)
+                {
+                    int j = k0 + w + W*t;
+                    if (j < NB)
+                    {
+#pragma unroll
+                        for (int v = 0; v < 4; v++)
+                            z[0][t][v] = strip(0)[16*(16*j + mfma_crow(lane, v))
+                                                  + mfma_lrow(lane)];
+                    }
+                }
+                store_rest(run());
             }
+
+            LUINV_TICK(2);
+
+            factor_panel<NP, W>(a, k, ns - 1 - s, rord, ipiv, cand, grow,
+                                ckey, dg);
+            block_sync();
+
+            LUINV_TICK(7);
+
+            if (tid < 16)
+                idg[tid] = 1.0 / dg[17*tid];
+            __syncthreads();
+
+            if (w < 2)
+                invert_diag(dg, idg, lane, w == 0, a + pk_block<NB>(k, k),
+                            uinv + 256*k);
+            block_sync();
+
+            LUINV_TICK(8);
         }
-        block_sync();
-
-        LUINV_TICK(2);
-
-        factor_panel<NP, W>(a, k, rord, ipiv, cand, grow, ckey, dg);
-        block_sync();
-
-        LUINV_TICK(7);
-
-        if (tid < 16)
-            idg[tid] = 1.0 / dg[17*tid];
-        __syncthreads();
-
-        if (w < 2)
-            invert_diag(dg, idg, lane, w == 0, s + 256*k, uinv + 256*k);
-        block_sync();
-
-        LUINV_TICK(8);
     }
 
     // Leave the row order for the solves

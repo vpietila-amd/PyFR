@@ -19,6 +19,7 @@ Options (environment variables, overriding the size policy):
                       factorisation
   LUINV_K2_MINBLK=<n> launch bounds minimum blocks per CU of the solves
   LUINV_NWORK=<n>     most matrices factorised at once on the mfma path
+  LUINV_STRIPS=<n>    strips of 16 columns per pass of the factorisation
   LUINV_SOLVE_SHARED=0|1  mfma solves sharing the loads of the factor
                       between the waves of a block through LDS
   LUINV_MINBLK=<n>    the same as LUINV_K2_MINBLK for the generated
@@ -77,6 +78,7 @@ def options(tplargs):
             'wpb': int(env.get('LUINV_WPB', wpb)),
             'k1minblk': int(env.get('LUINV_K1_MINBLK', 2 if nb <= 20 else 1)),
             'shared': shared,
+            'strips': int(env.get('LUINV_STRIPS', 1 if nb <= 20 else 2)),
             'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if nb <= 20 else 1))
         }
 
@@ -231,7 +233,7 @@ class LUInverse(BaselineLUInverse):
             defs = {
                 'LUINV_MFMA': 1, 'LUINV_N': t['n'], 'LUINV_NP': t['npad'],
                 'LUINV_WSZ': f"{t['wsz']}LL", 'LUINV_WPB': opts['wpb'],
-                'LUINV_K1MB': opts['k1minblk'],
+                'LUINV_K1MB': opts['k1minblk'], 'LUINV_S': opts['strips'],
                 'LUINV_K2MB': opts['k2minblk'], 'LUINV_TR': out.trows,
                 'LUINV_TC': out.tcols, 'LUINV_PADC': out.padc,
                 'LUINV_NDIES': b.ndies,
