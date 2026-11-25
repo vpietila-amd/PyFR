@@ -391,6 +391,34 @@ def _add_analysis_commands(sub):
     ap.set_defaults(func=cmd_roofline)
 
 
+# Phases of the baseline kernel
+
+def cmd_phases(args):
+    case = _case(args)
+    res = harness.run_phases(case, reps=args.reps)
+
+    over = res['instrumented_median_s'] / res['median_s'] - 1
+    print(f"{case.label()}: {res['median_s']*1e3:.3f} ms per launch, "
+          f"{res['instrumented_median_s']*1e3:.3f} ms instrumented "
+          f"({100*over:+.1f}%)")
+    print(f"  mean block lifetime {res['block_s']*1e6:.0f} us")
+    for k, v in res['phases'].items():
+        rate = (f"  {v['tflops']:6.2f} TFLOP/s" if 'tflops' in v else
+                f"  {v['gbs']:6.0f} GB/s" if 'gbs' in v else '')
+        print(f"  {k:12s} {v['block_s']*1e6:10.1f} us  "
+              f"{100*v['share']:5.1f}%{rate}")
+
+    _emit(res, args.out)
+
+
+def _add_phase_commands(sub):
+    ap = sub.add_parser('phases', help='time the phases of the baseline '
+                        'kernel through instrumented hip_ref')
+    _case_args(ap)
+    ap.add_argument('--reps', type=int, default=10)
+    ap.set_defaults(func=cmd_phases)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m bench.luinv')
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -399,6 +427,7 @@ def main(argv=None):
     _add_benchmark_commands(sub)
     _add_hipcc_commands(sub)
     _add_analysis_commands(sub)
+    _add_phase_commands(sub)
 
     args = ap.parse_args(argv)
     return args.func(args)

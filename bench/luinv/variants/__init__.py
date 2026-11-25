@@ -10,6 +10,9 @@ _variants = {
 
     # The baseline kernel compiled as hand written HIP
     'hip_ref': 'bench.luinv.variants.hip_ref:LUInverse',
+
+    # The same with the time spent in each phase recorded
+    'hip_ref_phases': 'bench.luinv.variants.hip_ref:PhasedLUInverse',
 }
 
 

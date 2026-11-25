@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
+from bench.luinv.analysis.model import itemsizes, phase_work
 from bench.luinv.check import inverse_errors, summarise
 from bench.luinv.env import environment
 from bench.luinv.inputs import make_jacobians
@@ -132,4 +133,53 @@ def run_bench(case, reps=20, warmup=2, verify=True):
             'nominal_tflops': flops / t / 1e12,
             'compulsory_gbs': nbytes / t / 1e9,
         },
+    }
+
+
+def run_phases(case, reps=10, warmup=2):
+    """Time the phases of the kernel against an uninstrumented run."""
+    from dataclasses import replace
+
+    res = {}
+    for v in ('hip_ref', 'hip_ref_phases'):
+        prob = build(replace(case, variant=v))
+        stage_and_invert(prob, case)
+        timer = Timer(prob.backend)
+
+        # One colour is enough to apportion the time
+        c, eidx = next(iter(prob.colours.items()))
+        jac = make_jacobians(case.kind, len(eidx), case.n, case.scale,
+                             seed=(case.seed, c))
+        prob.stage(c, jac)
+
+        timer(lambda: prob.invert(c, case.scale), 1, warmup)
+        if v == 'hip_ref_phases':
+            prob.impl.reset_phases()
+
+        res[v] = stats(timer(lambda: prob.invert(c, case.scale), reps, 0))
+
+    # Ticks are summed over every block of every repetition
+    nblocks = len(eidx)*reps
+    phases = {k: t / nblocks for k, t in prob.impl.read_phases().items()}
+    total = sum(phases.values())
+
+    # Rates of the phases with the blocks of a launch running together
+    flops, nbytes = phase_work(prob.impl.tplargs, *itemsizes(case.precision))
+    out = {}
+    for k, t in phases.items():
+        out[k] = {'block_s': t, 'share': t / total}
+        if k in flops and t:
+            out[k]['flops'] = flops[k]
+            out[k]['tflops'] = flops[k]*len(eidx) / t / 1e12
+        if k in nbytes and t:
+            out[k]['bytes'] = nbytes[k]
+            out[k]['gbs'] = nbytes[k]*len(eidx) / t / 1e9
+
+    return {
+        'mode': 'phases', 'case': asdict(case),
+        'env': environment(prob.backend),
+        'median_s': res['hip_ref']['median_s'],
+        'instrumented_median_s': res['hip_ref_phases']['median_s'],
+        'block_s': total,
+        'phases': out,
     }
