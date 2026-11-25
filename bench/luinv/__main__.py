@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -232,12 +233,58 @@ def _add_benchmark_commands(sub):
     ap.set_defaults(func=cmd_refs)
 
 
+# Offline hipcc builds of hand written kernels
+
+def cmd_hipcc(args):
+    os.environ['LUINV_COMPILER'] = 'hipcc'
+    res = harness.run_check(_case(args), nsample=4)
+
+    cmds = {}
+    for k in res['kernels']:
+        if k.get('artifacts'):
+            print(f"{k['name']}: {k['artifacts']}")
+            for key, val in (k['hipcc'] or {}).items():
+                print(f'  {key}: {val}')
+
+            adir = Path(k['artifacts'])
+            cmd = json.loads((adir / 'command.json').read_text())
+            cmds[cmd[-3]] = cmd
+
+    if not cmds:
+        print('No hand written HIP kernels in this variant', file=sys.stderr)
+        return 1
+
+    # Let clangd and friends see the exact compile commands
+    ccpath = Path(__file__).parent / 'build' / 'compile_commands.json'
+    try:
+        db = {e['file']: e for e in json.loads(ccpath.read_text())}
+    except FileNotFoundError:
+        db = {}
+
+    for f, cmd in cmds.items():
+        db[f] = {'directory': str(Path(f).parent), 'file': f,
+                 'arguments': cmd}
+
+    ccpath.write_text(json.dumps(list(db.values()), indent=1))
+    print(f'Updated {ccpath}')
+
+    return 0 if res['check']['passed'] else 1
+
+
+def _add_hipcc_commands(sub):
+    ap = sub.add_parser('hipcc', help='build hand written kernels with hipcc '
+                        'and report their resources')
+    _case_args(ap)
+    ap.set_defaults(func=cmd_hipcc)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m bench.luinv')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     _add_case_commands(sub)
     _add_benchmark_commands(sub)
+    _add_hipcc_commands(sub)
 
     args = ap.parse_args(argv)
     return args.func(args)

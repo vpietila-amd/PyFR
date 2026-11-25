@@ -7,6 +7,9 @@ _variants = {
 
     # Frozen copy of the implementation before the changes on this branch
     'baseline': 'bench.luinv.variants.baseline:LUInverse',
+
+    # The baseline kernel compiled as hand written HIP
+    'hip_ref': 'bench.luinv.variants.hip_ref:LUInverse',
 }
 
 

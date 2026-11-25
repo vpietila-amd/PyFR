@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 import math
 
+from bench.luinv.rawhip import RawHIPModule
+
 
 @contextmanager
 def record_kernels(backend):
@@ -20,18 +22,31 @@ def record_kernels(backend):
 
     def instantiate_kernel(dims, fun, args, meta):
         name = names.get(id(fun))
-        kernels.append(describe(fun, meta['block'], name,
-                                dims=list(dims)))
+        kernels.append(describe(fun, meta['block'], name, dims=list(dims),
+                                compiler='hiprtc'))
         return instantiate(dims, fun, args, meta)
 
+    # Hand written HIP kernels report themselves when made
+    def raw_kernel(self, name, argtypes, grid, block, sharedb=0):
+        kern = raw(self, name, argtypes, grid, block, sharedb)
+        kernels.append(describe(
+            kern.fun, block, name, dims=list(grid), compiler=self.compiler,
+            artifacts=str(self.artifacts) if self.artifacts else None,
+            hipcc=self.remarks().get(name)
+        ))
+        return kern
+
     build, instantiate = prov._build_kernel, prov._instantiate_kernel
+    raw = RawHIPModule.kernel
 
     prov._build_kernel = build_kernel
     prov._instantiate_kernel = instantiate_kernel
+    RawHIPModule.kernel = raw_kernel
     try:
         yield kernels
     finally:
         del prov._build_kernel, prov._instantiate_kernel
+        RawHIPModule.kernel = raw
 
 
 def describe(fun, block, name=None, **kwargs):
