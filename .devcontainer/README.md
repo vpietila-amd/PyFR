@@ -13,8 +13,17 @@ The image contains:
 - **Python:** a virtualenv in `/opt/venv` holding PyFR's runtime dependencies,
   pytest and ipython.
 
-PyFR itself is not baked in. The checkout is bind-mounted at `/workspace/PyFR`
-and installed in editable mode.
+PyFR itself is not baked in.
+
+- **Your home directory is bind-mounted at the same absolute path.** Every
+  host path is valid inside the container too: the checkout, scratch
+  directories, other repos.
+- The workspace folder is the checkout's own path, and PyFR is installed from
+  it in editable mode.
+- The container user's `$HOME` is still `/home/<user>` inside the image. This
+  keeps the container's VS Code server and caches out of your real home,
+  where they would clash with the host's `~/.vscode-server`.
+- The checkout must be inside your home directory.
 
 ## VS Code
 
@@ -33,8 +42,8 @@ docker build -f .devcontainer/Dockerfile \
 docker run --rm -it --device=/dev/kfd --device=/dev/dri \
     --group-add video --group-add render \
     --security-opt seccomp=unconfined --cap-add=SYS_PTRACE --ipc=host --init \
-    -v $PWD:/workspace/PyFR pyfr-hip-dev
+    -v $HOME:$HOME -w $PWD pyfr-hip-dev
 
-# first time, inside the container
-pip install -e /workspace/PyFR --no-deps
+# first time, inside the container (from the checkout)
+pip install -e . --no-deps
 ```

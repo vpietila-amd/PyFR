@@ -5,8 +5,10 @@
 #       --build-arg RENDER_GID=$(getent group render | cut -d: -f3) \
 #       -t pyfr-hip-dev .devcontainer
 #
-# The image carries dependencies only; PyFR is bind-mounted at /workspace/PyFR
-# and installed editable on first run (`pip install -e /workspace/PyFR --no-deps`).
+# The image carries dependencies only.  The host home directory is
+# bind-mounted at the same absolute path (see devcontainer.json / README.md)
+# and PyFR is installed editable from the checkout on first run
+# (`pip install -e <checkout> --no-deps`).
 #
 # Base: rocm/dev-ubuntu-24.04:10.2.0-full (ROCm 10.2.0, released 2026-11-18, the
 # newest tag on Docker Hub). Verified in the image: hipcc, amdclang++,
@@ -80,5 +82,5 @@ ENV ROCM_PATH=/opt/rocm \
     XDG_CACHE_HOME=/home/${USERNAME}/.cache \
     OMPI_MCA_rmaps_base_oversubscribe=1
 
-WORKDIR /workspace/PyFR
+WORKDIR /workspace
 CMD ["/bin/bash"]
