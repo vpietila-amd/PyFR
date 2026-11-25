@@ -139,23 +139,23 @@ __device__ __forceinline__ void invert_diag(const double* d,
                                             double* uinv)
 {
     const int c = lane % 16;
+
+    // Column c of the inverse by substitution a column of d at a time, each
+    // solved entry updating all the rows after it at once
     double y[16];
+#pragma unroll
+    for (int r = 0; r < 16; r++)
+        y[r] = (r == c);
 
     if (lower && lane < 16)
     {
-        // y_r = ([r == c] - sum_{k<r} L_rk y_k) / L_rr, with y_r = 0 for r < c
 #pragma unroll
-        for (int r = 0; r < 16; r++)
+        for (int k = 0; k < 16; k++)
         {
-            double s0 = (r == c), s1 = 0;
+            y[k] *= idg[k];
 #pragma unroll
-            for (int k = 0; k < r; k += 2)
-            {
-                s0 -= d[16*r + k]*y[k];
-                if (k + 1 < r)
-                    s1 -= d[16*r + k + 1]*y[k + 1];
-            }
-            y[r] = r < c ? 0.0 : (s0 + s1)*idg[r];
+            for (int r = k + 1; r < 16; r++)
+                y[r] -= d[16*r + k]*y[k];
         }
 
 #pragma unroll
@@ -164,19 +164,12 @@ __device__ __forceinline__ void invert_diag(const double* d,
     }
     else if (!lower && lane < 16)
     {
-        // y_r = [r == c] - sum_{k>r} U_rk y_k, with y_r = 0 for r > c
 #pragma unroll
-        for (int r = 15; r >= 0; r--)
+        for (int k = 15; k >= 0; k--)
         {
-            double s0 = (r == c), s1 = 0;
 #pragma unroll
-            for (int k = r + 1; k < 16; k += 2)
-            {
-                s0 -= d[16*r + k]*y[k];
-                if (k + 1 < 16)
-                    s1 -= d[16*r + k + 1]*y[k + 1];
-            }
-            y[r] = r > c ? 0.0 : s0 + s1;
+            for (int r = 0; r < k; r++)
+                y[r] -= d[16*r + k]*y[k];
         }
 
 #pragma unroll
@@ -260,15 +253,17 @@ __device__ __noinline__ void factor_panel(
         const unsigned long long mine = key;
         key = wave_max(key);
 
-        // Post the best row of the wave, and the diagonal row
+        // Post the best row of the wave as it would be as the pivot row,
+        // scaled right of the diagonal, and the diagonal row
 #pragma unroll
         for (int q = 0; q < NQ; q++)
         {
             if (mq == q && mine == key)
             {
+                const double ipv = 1.0 / pv[q][j];
 #pragma unroll
                 for (int c = 0; c < 16; c++)
-                    cand[b][w][c] = pv[q][c];
+                    cand[b][w][c] = c > j ? pv[q][c]*ipv : pv[q][c];
             }
         }
         if (tid == j)
@@ -297,9 +292,8 @@ __device__ __noinline__ void factor_panel(
         if (tid == 0)
             ipiv[j] = mi;
 
-        // Swap in the pivot row, scale it and eliminate the rows below
+        // Swap in the pivot row and eliminate the rows below
         const double* pr = cand[b][wb];
-        const double ipv = 1.0 / pr[j];
 #pragma unroll
         for (int q = 0; q < NQ; q++)
         {
@@ -308,7 +302,7 @@ __device__ __noinline__ void factor_panel(
             {
 #pragma unroll
                 for (int c = 0; c < 16; c++)
-                    pv[q][c] = c > j ? pr[c]*ipv : pr[c];
+                    pv[q][c] = pr[c];
             }
             else if (r > gk && r < NP)
             {
@@ -321,7 +315,7 @@ __device__ __noinline__ void factor_panel(
                 double lv = pv[q][j];
 #pragma unroll
                 for (int c = j + 1; c < 16; c++)
-                    pv[q][c] -= lv*(pr[c]*ipv);
+                    pv[q][c] -= lv*pr[c];
             }
         }
     }
