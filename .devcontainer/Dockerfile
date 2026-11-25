@@ -68,7 +68,8 @@ USER ${UID}:${GID}
 RUN pip install \
       "numpy>=2.4.2" "mako>=1.0.0" "h5py>=2.10" "gimmik>=4.0" "boostree>=0.3.0" \
       "platformdirs>=2.2.0" "mpi4py>=4.0.0" \
-      pytest pytest-xdist ipython
+      pytest pytest-xdist ipython \
+      scipy pandas matplotlib
 
 # ROCm / PyFR environment. PyFR dlopens libamdhip64, libhiprtc, librocblas and
 # librocprofiler-sdk-roctx by soname, so /opt/rocm/lib must be on the loader path.
