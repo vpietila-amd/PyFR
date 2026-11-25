@@ -6,11 +6,11 @@
 // A^-1 = U^-1 L^-1 P, so with Z = U^-1 L^-1 solving L U Z = I column by
 // column, column k of Z is column perm[k] of A^-1.
 //
-// lu_pack first copies the factor into the workspace after it as NB x NB
-// blocks of 16 x 16 (NB = NP/16) in the order of the A operand of the
-// MFMA, with the inverses of the diagonal blocks of L in place of them and
-// those of U after all the blocks.  A wave then loads the operands of a
-// block as 2 KB in a row.
+// The factor comes packed from lu_factor in factor.hpp: NB x NB blocks of
+// 16 x 16 (NB = NP/16), stored a strip of 16 columns at a time, each block
+// in the order of the A operand of the MFMA so a wave loads it as 2 KB in a
+// row; the inverses of the diagonal blocks of L are in place of them, and
+// those of U come after all the blocks.
 //
 // lu_solve_mfma has every wave solve for 16 columns of Z on its own,
 // holding them in registers as NB accumulator tiles of 16 x 16; nothing is
@@ -30,9 +30,10 @@
 namespace luinv
 {
 
-// Offsets in the packed factor of block (j, i) and of the inverse of U_ii
+// Offsets in the packed factor of block (j, i), in strip i, and of the
+// inverse of U_ii after the strips
 template<int NB>
-__device__ __forceinline__ int pk_block(int j, int i) { return 256*(NB*j + i); }
+__device__ __forceinline__ int pk_block(int j, int i) { return 256*(NB*i + j); }
 
 template<int NB>
 __device__ __forceinline__ int pk_uinv(int i) { return 256*(NB*NB + i); }
@@ -44,18 +45,29 @@ __device__ __forceinline__ int pk_ix(int r, int c)
     return 4*(r + 16*(c % 4)) + c / 4;
 }
 
-// acc +/- M . Z for the packed 16 x 16 block M at m
-template<bool Neg>
-__device__ __forceinline__ f64x4 block_mma(const double* m, int lane,
-                                           f64x4 z, f64x4 acc)
+// The A operands the lane holds of the packed 16 x 16 block at m
+__device__ __forceinline__ f64x4 load_a(const double* m, int lane)
 {
-    f64x4 a = *reinterpret_cast<const f64x4*>(m + 4*lane);
+    return *reinterpret_cast<const f64x4*>(m + 4*lane);
+}
 
+// acc +/- M . Z for the block M whose A operands are a
+template<bool Neg>
+__device__ __forceinline__ f64x4 mma_a(f64x4 a, f64x4 z, f64x4 acc)
+{
 #pragma unroll
     for (int s = 0; s < 4; s++)
         acc = mfma_f64_16x16x4(Neg ? -a[s] : a[s], z[s], acc);
 
     return acc;
+}
+
+// acc +/- M . Z for the packed 16 x 16 block M at m
+template<bool Neg>
+__device__ __forceinline__ f64x4 block_mma(const double* m, int lane,
+                                           f64x4 z, f64x4 acc)
+{
+    return mma_a<Neg>(load_a(m, lane), z, acc);
 }
 
 // Solve L U Z = I for the 16 columns of Z from column block cb, given the
@@ -124,7 +136,7 @@ __device__ __forceinline__ void lu_solve_mfma(
     const int cb = int(b % BPM)*WPB + threadIdx.x / 64;
 
     const IX wk = wk_v[x];
-    const double* pk = ws_v + wk*WSZ + NP*NP;
+    const double* pk = ws_v + wk*WSZ;
     const short* perm = perm_v + wk*NP;
 
     f64x4 z[NB];
@@ -147,76 +159,6 @@ __device__ __forceinline__ void lu_solve_mfma(
                     inv[tiled_ix<TR, TC, PADC>(r, gcol)] = z[j][v];
             }
         }
-    }
-}
-
-// Pack block row j of the factor of one matrix per block of 256 lanes;
-// lanes 0-15 also invert the diagonal block of L, a column each, and lanes
-// 16-31 that of U
-template<int NP, long long WSZ, typename IX>
-__device__ __forceinline__ void lu_pack(IX b, const IX* __restrict__ wk_v,
-                                        double* __restrict__ ws_v)
-{
-    constexpr int NB = NP/16;
-
-    const IX x = b / NB;
-    const int j = int(b % NB), t = threadIdx.x;
-
-    double* f = ws_v + wk_v[x]*WSZ;
-    double* pk = f + NP*NP;
-
-    // Copy the off diagonal blocks, each lane a run of 4 contiguous entries
-    for (int e = 4*t; e < 256*NB; e += 4*256)
-    {
-        int i = e / 256, l = e % 256 / 4;
-        if (i == j)
-            continue;
-
-        const double* m = f + NP*(16*j + mfma_lrow(l)) + 16*i + mfma_lk(l);
-        f64x4 a = {m[0], m[4], m[8], m[12]};
-        *reinterpret_cast<f64x4*>(pk + pk_block<NB>(j, i) + 4*l) = a;
-    }
-
-    if (t >= 32)
-        return;
-
-    const double* d = f + NP*16*j + 16*j;
-    const int c = t % 16;
-    double y[16];
-
-    if (t < 16)
-    {
-        // Lower: y_r = ([r == c] - sum_{k<r} L_rk y_k) / L_rr
-#pragma unroll
-        for (int r = 0; r < 16; r++)
-        {
-            double s = (r == c);
-#pragma unroll
-            for (int k = 0; k < r; k++)
-                s -= d[NP*r + k]*y[k];
-            y[r] = r < c ? 0.0 : s / d[NP*r + r];
-        }
-
-#pragma unroll
-        for (int r = 0; r < 16; r++)
-            pk[pk_block<NB>(j, j) + pk_ix(r, c)] = y[r];
-    }
-    else
-    {
-        // Unit upper: y_r = [r == c] - sum_{k>r} U_rk y_k
-#pragma unroll
-        for (int r = 15; r >= 0; r--)
-        {
-            double s = (r == c);
-#pragma unroll
-            for (int k = r + 1; k < 16; k++)
-                s -= d[NP*r + k]*y[k];
-            y[r] = r > c ? 0.0 : s;
-        }
-
-#pragma unroll
-        for (int r = 0; r < 16; r++)
-            pk[pk_uinv<NB>(j) + pk_ix(r, c)] = y[r];
     }
 }
 

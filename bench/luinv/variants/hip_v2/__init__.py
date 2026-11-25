@@ -1,26 +1,36 @@
-"""The LU inverse split into a factorisation and a solve kernel.
+"""The LU inverse in separate kernels for the factorisation and the solves.
 
-The factorisation kernel takes one matrix per block, as the baseline does,
-and leaves the factor and row order in the workspace.  The solve kernel
-then takes one column chunk of one matrix per block, so the solves, the
-larger part of the work, run with as many blocks as there are chunks.  Each
-chunk has its own right-hand side area in the workspace.
+For fp64 the kernels are hand written with MFMA (see include/luinv/hip_v2):
+lu_build forms I - scale*src in a strip-major workspace, lu_factor_mfma
+factorises it left-looking with one wave per matrix, leaving the factor
+packed for the MFMA, and lu_solve_mfma solves for 16 columns of the inverse
+per wave.  The matrices are padded to a multiple of 16 for them.
 
-Both kernels come from the rendering of the frozen baseline template with
-the quick wins of hip_opt applied for the size, split at the start of the
-solves.  Options (environment variables, overriding the size policy):
-  LUINV_MINBLK=<n>    launch bounds minimum blocks per CU of both kernels
-  LUINV_K2_MINBLK=<n> the same for the solve kernel only
-  LUINV_PIVOT=<mode>  pivot arg-max: shfl (default) or lds (the baseline)
-  LUINV_IX32=0|1      hoist the int64 workspace base out of the indices
-  LUINV_K2=<kind>     solves: mfma (hand written, the default where it
-                      applies: fp64 with npad a multiple of 16) or gen
+Otherwise both kernels come from the rendering of the frozen baseline
+template with the quick wins of hip_opt applied for the size, split at the
+start of the solves: the factorisation takes one matrix per block and the
+solves one column chunk of one matrix per block, each chunk with its own
+right-hand side area in the workspace.
+
+Options (environment variables, overriding the size policy):
+  LUINV_PATH=<path>   mfma (the default for fp64) or gen
   LUINV_WPB=<n>       waves per block of the mfma solves
+  LUINV_K1_MINBLK=<n> launch bounds minimum blocks per CU of the mfma
+                      factorisation
+  LUINV_K2_MINBLK=<n> launch bounds minimum blocks per CU of the solves
+  LUINV_NWORK=<n>     most matrices factorised at once on the mfma path
+  LUINV_MINBLK=<n>    the same as LUINV_K2_MINBLK for the generated
+                      factorisation
+  LUINV_PIVOT=<mode>  generated pivot arg-max: shfl (default) or lds
+  LUINV_IX32=0|1      generated: hoist the int64 workspace base out of the
+                      indices
 """
 from functools import cached_property
 from pathlib import Path
 import os
 import re
+
+import numpy as np
 
 from bench.luinv.rawhip import PTR, RawHIPModule, hipcc_compatible
 from bench.luinv.variants.baseline import LUInverse as BaselineLUInverse
@@ -34,41 +44,49 @@ GENERATED = INCLUDE / 'luinv' / 'hip_v2' / 'generated'
 TEMPLATE = 'bench.luinv.variants.baseline.lu_inv_baseline'
 
 FACTOR, SOLVE = 'lu_factor_hip_v2', 'lu_solve_hip_v2'
-PACK, SOLVE_MFMA = 'lu_pack_hip_v2', 'lu_solve_mfma_hip_v2'
+BUILD, FACTOR_MFMA = 'lu_build_hip_v2', 'lu_factor_mfma_hip_v2'
+SOLVE_MFMA = 'lu_solve_mfma_hip_v2'
 
 
 def nchunk(tplargs):
     return -(-tplargs['npad'] // tplargs['sc'])
 
 
+def mfma_path(t):
+    return t['ftype'] == t['stype'] == t['otype'] == 'double'
+
+
 def options(tplargs):
     """The options for the size, overridden by the environment."""
-    # Big matrices spill heavily at 2 blocks per CU
-    big = tplargs['npad'] > 512
-    opts = {'pivot': 'shfl', 'minblk': 1 if big else 2, 'ix32': True}
+    env, t = os.environ, tplargs
 
-    env = os.environ
+    path = env.get('LUINV_PATH', 'mfma' if mfma_path(t) else 'gen')
+    if path == 'mfma':
+        nb = t['npad'] // 16
+        wpb = next(w for w in (4, 2, 1) if nb % w == 0)
+
+        # Two waves per SIMD while the tiles of Z fit in half the registers
+        return {
+            'path': path,
+            'wpb': int(env.get('LUINV_WPB', wpb)),
+            'k1minblk': int(env.get('LUINV_K1_MINBLK', 2 if nb <= 20 else 1)),
+            'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if nb <= 20 else 1))
+        }
+
+    # Big matrices spill heavily at 2 blocks per CU
+    big = t['npad'] > 512
+    opts = {'path': 'gen', 'pivot': 'shfl', 'minblk': 1 if big else 2,
+            'ix32': True}
+
     if 'LUINV_MINBLK' in env:
         opts['minblk'] = int(env['LUINV_MINBLK'])
-
-    # The solves spill less, so keep two blocks per CU for them
-    opts['k2minblk'] = int(env.get('LUINV_K2_MINBLK', 2))
     if 'LUINV_PIVOT' in env:
         opts['pivot'] = env['LUINV_PIVOT']
     if 'LUINV_IX32' in env:
         opts['ix32'] = env['LUINV_IX32'] not in ('', '0')
 
-    # The MFMA solves take fp64 in 16 x 16 tiles
-    nb, mfma = tplargs['npad'] // 16, tplargs['npad'] % 16 == 0
-    mfma &= tplargs['ftype'] == tplargs['otype'] == 'double'
-    opts['k2'] = env.get('LUINV_K2', 'mfma' if mfma else 'gen')
-    if opts['k2'] == 'mfma':
-        wpb = next(w for w in (4, 2, 1) if nb % w == 0)
-        opts['wpb'] = int(env.get('LUINV_WPB', wpb))
-
-        # Two waves per SIMD while the tiles of Z fit in half the registers
-        opts['k2minblk'] = int(env.get('LUINV_K2_MINBLK',
-                                       2 if nb <= 20 else 1))
+    # The solves spill less, so keep two blocks per CU for them
+    opts['k2minblk'] = int(env.get('LUINV_K2_MINBLK', 2))
 
     return opts
 
@@ -163,9 +181,23 @@ class LUInverse(BaselineLUInverse):
     def _tplargs(self, m, out):
         t = super()._tplargs(m, out)
 
-        # The factor, then a right-hand side area for each column chunk or
-        # the packed factor and inverses of the diagonal blocks of U
-        t['wsz'] = t['npad']*(t['npad'] + nchunk(t)*t['sc'] + 16)
+        if os.environ.get('LUINV_PATH', 'mfma') == 'mfma' and mfma_path(t):
+            # Pad to a multiple of 16 for the hand written kernels, whose
+            # workspace holds the packed factor and the inverses of the
+            # diagonal blocks of U
+            t['npad'] = npad = -(-t['n'] // 16)*16
+            t['wsz'] = npad*(npad + 16)
+
+            # Factorise more matrices at once, within a 2 GiB workspace
+            nwork = int(os.environ.get('LUINV_NWORK', 0))
+            nwork = nwork or max(512, min(4096, 2**28 // t["wsz"]))
+
+            # Starting each part at a whole AoSoA group of the matrices
+            t['nwork'] = min(nwork // 64 * 64, m.ioshape[2])
+        else:
+            # The factor, then a right-hand side area for each column chunk
+            t['wsz'] = t['npad']*(t['npad'] + nchunk(t)*t['sc'])
+
         return t
 
     @cached_property
@@ -173,62 +205,86 @@ class LUInverse(BaselineLUInverse):
         return options(self.tplargs)
 
     @cached_property
-    def module(self):
-        t, opts, out = self.tplargs, self.opts, self.out
-        hdr = generate(self.backend, t, opts)
+    def ticks(self):
+        # Cycles per phase of the factorisation, with LUINV_PHASES set
+        return self.backend.hip.mem_alloc(8*16)
 
-        defs = {'LUINV_HEADER': hdr.name}
-        if opts['k2'] == 'mfma':
-            defs |= {
+    def read_ticks(self):
+        self.backend.wait()
+        out = np.zeros(16, dtype=np.uint64)
+        self.backend.hip.memcpy(out, self.ticks, out.nbytes)
+        self.backend.hip.memset(self.ticks, 0, out.nbytes)
+        return out
+
+    @cached_property
+    def module(self):
+        b, t, opts, out = self.backend, self.tplargs, self.opts, self.out
+
+        if opts['path'] == 'mfma':
+            defs = {
                 'LUINV_MFMA': 1, 'LUINV_N': t['n'], 'LUINV_NP': t['npad'],
                 'LUINV_WSZ': f"{t['wsz']}LL", 'LUINV_WPB': opts['wpb'],
+                'LUINV_K1MB': opts['k1minblk'],
                 'LUINV_K2MB': opts['k2minblk'], 'LUINV_TR': out.trows,
-                'LUINV_TC': out.tcols, 'LUINV_PADC': out.padc
+                'LUINV_TC': out.tcols, 'LUINV_PADC': out.padc,
+                'LUINV_NDIES': b.ndies,
+                'LUINV_IXTYPE': {4: 'int', 8: 'int64_t'}[
+                    np.dtype(b.ixdtype).itemsize
+                ]
             }
+            if os.environ.get('LUINV_PHASES'):
+                defs['LUINV_PHASES'] = 1
+        else:
+            hdr = generate(b, t, opts)
+            defs = {'LUINV_HEADER': hdr.name}
 
-        return RawHIPModule(self.backend, HERE / 'lu_inv.hip', INCLUDE,
-                            defines=defs)
+        return RawHIPModule(b, HERE / 'lu_inv.hip', INCLUDE, defines=defs)
 
     @cached_property
     def kerns(self):
-        b = self.backend
-        argt = [b.ixdtype, b.fpdtype, PTR, PTR, PTR, PTR, b.ixdtype, PTR,
-                PTR]
-        block = (self.tplargs['nthreads'], 1, 1)
-        nc = nchunk(self.tplargs)
-
-        mod, sizes = self.module, {v.n for ps in self.parts.values()
-                                   for _, v in ps}
+        b, t, mod = self.backend, self.tplargs, self.module
+        sizes = {v.n for ps in self.parts.values() for _, v in ps}
 
         # The kernels for each number of items inverted at once
         kerns = {}
         for s in sizes:
-            ks = [mod.kernel(FACTOR, argt, (s, 1, 1), block)]
-            if self.opts['k2'] == 'mfma':
-                nb, wpb = self.tplargs['npad'] // 16, self.opts['wpb']
-                ks.append(mod.kernel(PACK, [b.ixdtype, PTR, PTR],
-                                     (s*nb, 1, 1), (256, 1, 1)))
-                ks.append(mod.kernel(SOLVE_MFMA, [b.ixdtype] + [PTR]*5,
-                                     (s*nb // wpb, 1, 1), (64*wpb, 1, 1)))
+            if self.opts['path'] == 'mfma':
+                nb, wpb = t['npad'] // 16, self.opts['wpb']
+                kerns[s] = [
+                    mod.kernel(BUILD, [b.ixdtype, b.fpdtype, PTR, b.ixdtype,
+                                       PTR, PTR],
+                               (-(-s // 64)*t['npad'], 1, 1), (256, 1, 1)),
+                    mod.kernel(FACTOR_MFMA, [b.ixdtype, PTR, PTR, PTR, PTR],
+                               (s, 1, 1), (256, 1, 1)),
+                    mod.kernel(SOLVE_MFMA, [b.ixdtype] + [PTR]*5,
+                               (s*nb // wpb, 1, 1), (64*wpb, 1, 1))
+                ]
             else:
-                ks.append(mod.kernel(SOLVE, argt, (s*nc, 1, 1), block))
-
-            kerns[s] = ks
+                argt = [b.ixdtype, b.fpdtype, PTR, PTR, PTR, PTR, b.ixdtype,
+                        PTR, PTR]
+                block = (t['nthreads'], 1, 1)
+                kerns[s] = [
+                    mod.kernel(FACTOR, argt, (s, 1, 1), block),
+                    mod.kernel(SOLVE, argt, (s*nchunk(t), 1, 1), block)
+                ]
 
         return kerns
 
     def invert(self, key, scale):
         for src, inv in self.parts[key]:
             ks = self.kerns[inv.n]
-            args = (inv.n, scale, *inv.kargs('v'), self.perm,
-                    *src.kargs('ml'), self.wk, self.ws)
-            ks[0].set_args(*args)
 
-            if self.opts['k2'] == 'mfma':
-                ks[1].set_args(inv.n, self.wk, self.ws)
+            if self.opts['path'] == 'mfma':
+                ks[0].set_args(inv.n, scale, *src.kargs('ml'), self.wk,
+                               self.ws)
+                ks[1].set_args(inv.n, self.wk, self.ws, self.perm,
+                               self.ticks)
                 ks[2].set_args(inv.n, *inv.kargs('v'), self.perm, self.wk,
                                self.ws)
             else:
-                ks[1].set_args(*args)
+                args = (inv.n, scale, *inv.kargs('v'), self.perm,
+                        *src.kargs('ml'), self.wk, self.ws)
+                for k in ks:
+                    k.set_args(*args)
 
             self.backend.run_kernels(ks)
