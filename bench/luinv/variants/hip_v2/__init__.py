@@ -78,35 +78,54 @@ def options(tplargs, ncu=304):
     if path == 'mfma':
         nb = t['npad'] // 16
 
-        # Blocks per CU as the registers allow, fp32 taking half as many,
-        # and for big matrices two strips per pass of the factorisation and
-        # eight waves to a block, cutting the latency of each matrix.
+        # The shape of the factorisation as measured best on MI325X: waves
+        # per block (k1w), strips per pass (strips) and waves per SIMD
+        # (k1minblk), which with the registers decide the blocks per CU.
+        # fp32 tiles take half the registers of fp64, so fp32 runs more
+        # blocks and keeps four waves to larger matrices; the irregular
+        # bounds follow where each shape starts to spill.  Eight waves and
+        # two strips cut the latency of each big matrix instead.
         #
         # Inverting the diagonal blocks out of line (iol) frees registers
         # for more blocks, except in fp64 above 16 strips where the updates
         # take nearly them all.  A launch of at most three matrices per CU
-        # gains nothing from more blocks, and in fp64 then loses to the
-        # cost.  Not with eight waves: at n=625 the factorisation then goes
-        # wrong with pivoting, under HIPRTC and hipcc alike (it spills and
-        # calls two functions), for at best 2%.
-        small, f32 = nb <= 20, t['ftype'] == 'float'
-        few = t['nwork'] <= 3*ncu
-        if not small:
-            k1minblk, iol = 1, False
-        elif few and not f32:
-            k1minblk, iol = 2, False
+        # gains nothing from more blocks, and in fp64 then loses to their
+        # cost.  Never with eight waves: at n=625 the factorisation then
+        # goes wrong with pivoting, under HIPRTC and hipcc alike (it spills
+        # and calls two functions).
+        f32, few = t['ftype'] == 'float', t['nwork'] <= 3*ncu
+        if f32:
+            if nb <= 13:
+                k1w, strips, k1minblk = 4, 1, 4 if nb <= 8 else 3
+            elif nb <= 20:
+                k1w, strips, k1minblk = 4, 2, 3
+            elif nb <= 29:
+                k1w, strips, k1minblk = 4, 1, 3
+            elif nb <= 32:
+                k1w, strips, k1minblk = 4, 2, 2
+            else:
+                k1w, strips, k1minblk = 8, 2, 1
+            iol = k1w == 4
+        elif nb <= 26:
+            k1w, strips = 4, 1
+            k1minblk = 4 if nb <= 8 and not few else 2
+            iol = nb <= 16 and not few
         else:
-            k1minblk = 4 if nb <= 8 else 3 if f32 else 2
-            iol = f32 or nb <= 16
+            k1w, strips, k1minblk, iol = 8, 2, 1, False
+
+        # The solves: two waves to a block for the fewest column blocks,
+        # where four leave many idle, and one wave per SIMD above 20 strips,
+        # where their registers spill otherwise
+        wpb, k2minblk = 2 if nb <= 6 else 4, 2 if nb <= 20 else 1
 
         return {
             'path': path,
-            'wpb': int(env.get('LUINV_WPB', 4)),
+            'wpb': int(env.get('LUINV_WPB', wpb)),
             'k1minblk': int(env.get('LUINV_K1_MINBLK', k1minblk)),
-            'k1w': int(env.get('LUINV_K1_WAVES', 4 if small else 8)),
-            'strips': int(env.get('LUINV_STRIPS', 1 if small else 2)),
+            'k1w': int(env.get('LUINV_K1_WAVES', k1w)),
+            'strips': int(env.get('LUINV_STRIPS', strips)),
             'iol': int(env.get('LUINV_INV_OOL', iol)),
-            'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if small else 1))
+            'k2minblk': int(env.get('LUINV_K2_MINBLK', k2minblk))
         }
 
     # Big matrices spill heavily at 2 blocks per CU
