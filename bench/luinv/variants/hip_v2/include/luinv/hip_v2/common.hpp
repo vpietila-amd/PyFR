@@ -1,6 +1,5 @@
-// Types and block numbering of the hand written kernels, matching those of
-// the PyFR kernels: LUINV_IXTYPE is the index type of the memory model and
-// LUINV_NDIES the number of dies (XCDs) the blocks are dealt across.
+// What the hand written kernels share with the PyFR kernels: the fixed
+// width integers HIPRTC lacks, and the numbering of the blocks.
 #pragma once
 
 #if defined(__HIPCC_RTC__)
@@ -8,10 +7,18 @@ typedef short int16_t;
 typedef long long int64_t;
 #endif
 
-typedef LUINV_IXTYPE ixdtype_t;
+namespace luinv
+{
 
-// Give each die a contiguous range of blocks, as PYFR_BLOCK_ID does, so the
-// blocks of a matrix run on one die and share its L2
-#define LUINV_BLOCK_ID ((blockIdx.x % LUINV_NDIES)*(gridDim.x / LUINV_NDIES) \
-    + min(blockIdx.x % LUINV_NDIES, gridDim.x % LUINV_NDIES)                  \
-    + blockIdx.x / LUINV_NDIES)
+// The number of the block as PYFR_BLOCK_ID gives it: each of the NDIES dies
+// (XCDs) the blocks are dealt across round robin takes a contiguous range,
+// so neighbouring blocks share the L2 of their die
+template<int NDIES, typename IX>
+__device__ __forceinline__ IX block_id()
+{
+    return IX((blockIdx.x % NDIES)*(gridDim.x / NDIES)
+              + min(blockIdx.x % NDIES, gridDim.x % NDIES)
+              + blockIdx.x / NDIES);
+}
+
+}

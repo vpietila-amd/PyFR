@@ -175,15 +175,19 @@ __device__ __forceinline__ int tiled_ix(int r, int c)
     return (r / TR)*(PADC / TC)*TR*TC + (c / TC)*TR*TC + (r % TR)*TC + c % TC;
 }
 
-// One block of WPB waves per WPB*16 columns of one matrix, the last block
-// of a matrix with fewer columns than that; the inverse is written as OT
-template<int N, int NP, long long WSZ, int WPB, int TR, int TC, int PADC,
-         typename T, typename OT, typename IX>
+// One block of C::WPB waves per WPB*16 columns of one matrix, the last
+// block of a matrix with fewer columns than that; the inverse is written as
+// C::OT in tiles of C::TR x C::TC
+template<class C, typename T = typename C::T, typename OT = typename C::OT,
+         typename IX = typename C::IX>
 __device__ __forceinline__ void lu_solve_mfma(
     IX b, OT* __restrict__ inv_v, const IX* __restrict__ inv_vix,
     const short* __restrict__ perm_v, const IX* __restrict__ wk_v,
     const T* __restrict__ ws_v)
 {
+    constexpr int N = C::N, NP = C::NP, WPB = C::WPB;
+    constexpr int TR = C::TR, TC = C::TC, PADC = C::PADC;
+    constexpr long long WSZ = C::WSZ;
     constexpr int NB = NP/16, BPM = (NB + WPB - 1)/WPB;
 
     const int lane = threadIdx.x % 64, w = threadIdx.x / 64;

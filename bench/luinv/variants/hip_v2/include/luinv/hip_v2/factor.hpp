@@ -24,6 +24,7 @@
 // the time, so they take the row interchanges as they are loaded.
 #pragma once
 
+#include "luinv/hip_v2/config.hpp"
 #include "luinv/hip_v2/mfma.hpp"
 #include "luinv/hip_v2/solve.hpp"
 #include "luinv/hip_v2/types.hpp"
@@ -66,13 +67,14 @@ __device__ __forceinline__ vec2<T> load_pair(const ST* p)
 // through its own LDS: it loads them two matrices a lane, so the loads of a
 // column coalesce, and stores them two columns a lane, so those of a matrix
 // do.  The groups of src are whole, so the loads need no guard past nx.
-template<int N, int NP, long long WSZ, typename T, typename ST, typename FT,
-         typename IX>
+template<class C, typename T = typename C::T, typename ST = typename C::ST,
+         typename FT = typename C::FT, typename IX = typename C::IX>
 __device__ __forceinline__ void lu_build(
     IX b, IX nx, FT scale, const ST* __restrict__ src_v, IX ldsrc,
     const IX* __restrict__ wk_v, T* __restrict__ ws_v)
 {
-    constexpr int SOA = 64;
+    constexpr int N = C::N, NP = C::NP, SOA = 64;
+    constexpr long long WSZ = C::WSZ;
     __shared__ T stw[4][16][17];
 
     const IX g = b / NP;
@@ -237,18 +239,39 @@ __device__ __forceinline__ void block_sync()
     __syncthreads();
 }
 
-// Cycles wave 0 spends in each phase of the factorisation, summed into
-// ticks when LUINV_PHASES is defined
-#if defined(LUINV_PHASES)
-#define LUINV_TICK(k) do { if (threadIdx.x == 0) { long long _t = clock64(); \
-    ph[k] += _t - t0; t0 = _t; } } while (0)
-#else
-#define LUINV_TICK(k) do {} while (0)
-#endif
+// Cycles wave 0 spends in each phase of the factorisation, with C::PHASES
+// summed into ticks: 0 load, 1 update, 2 store, 7 panel and 8 invert
+template<bool PHASES>
+struct phase_ticks
+{
+    long long ph[9] = {}, t0;
 
-// Phases of lu_factor, in the order of LUINV_TICK
-#define LUINV_FACTOR_PHASES "load", "update", "store", "", "", "", "", \
-    "panel", "invert"
+    __device__ phase_ticks() : t0(clock64()) {}
+
+    __device__ void operator()(int k)
+    {
+        if (threadIdx.x == 0)
+        {
+            long long t = clock64();
+            ph[k] += t - t0;
+            t0 = t;
+        }
+    }
+
+    __device__ void sum(unsigned long long* ticks)
+    {
+        if (threadIdx.x == 0)
+            for (int i = 0; i < 9; i++)
+                atomicAdd(ticks + i, (unsigned long long) ph[i]);
+    }
+};
+
+template<>
+struct phase_ticks<false>
+{
+    __device__ void operator()(int) {}
+    __device__ void sum(unsigned long long*) {}
+};
 
 // Factor rows r0 = 16k to NP - 1 of the panel of strip k, which the block
 // left row major in the strip, a row per lane and pass.  For each column the
@@ -440,19 +463,20 @@ __device__ __noinline__ void factor_panel(
 // before it to all its strips at once, each operand serving all of them,
 // then factorises its strips in turn, applying those of the pass before.
 //
-// The panel is spread over all the lanes too; see factor_panel.  IOL keeps
-// the inversions of the diagonal blocks out of line.
-template<int NP, long long WSZ, int W, int S, bool IOL, typename T,
-         typename IX>
+// The panel is spread over all the lanes too; see factor_panel.  With
+// C::IOL the inversions of the diagonal blocks are out of line.
+template<class C, typename T = typename C::T, typename IX = typename C::IX>
 __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                                           T* __restrict__ ws_v,
                                           short* __restrict__ perm_v,
                                           unsigned long long* ticks)
 {
-#if defined(LUINV_PHASES)
-    long long ph[9] = {}, t0 = clock64();
-#endif
+    constexpr int NP = C::NP, W = C::K1W, S = C::S;
+    constexpr bool IOL = C::IOL;
+    constexpr long long WSZ = C::WSZ;
     constexpr int NB = NP/16, NT = (NB + W - 1)/W, NL = 64*W;
+
+    phase_ticks<C::PHASES> tick;
 
     __shared__ short rord[NP];
     __shared__ T dg[256], idg[16];
@@ -658,11 +682,11 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
             }
         }
 
-        LUINV_TICK(0);
+        tick(0);
 
         store_rest(run());
 
-        LUINV_TICK(1);
+        tick(1);
 
         for (int s = 0; s < ns; s++)
         {
@@ -688,13 +712,13 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                 store_rest(run());
             }
 
-            LUINV_TICK(2);
+            tick(2);
 
             factor_panel<NP, W, T>(a, k, ns - 1 - s, rord, ipiv, cand, grow,
                                 ckey, dg);
             block_sync();
 
-            LUINV_TICK(7);
+            tick(7);
 
             if (tid < 16)
                 idg[tid] = T(1) / dg[17*tid];
@@ -711,7 +735,7 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
             }
             block_sync();
 
-            LUINV_TICK(8);
+            tick(8);
         }
     }
 
@@ -720,11 +744,7 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
     for (int r = tid; r < NP; r += NL)
         perm[r] = rord[r];
 
-#if defined(LUINV_PHASES)
-    if (tid == 0)
-        for (int i = 0; i < 9; i++)
-            atomicAdd(ticks + i, (unsigned long long) ph[i]);
-#endif
+    tick.sum(ticks);
 }
 
 }
