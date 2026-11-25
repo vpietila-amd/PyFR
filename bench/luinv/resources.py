@@ -1,7 +1,14 @@
 from contextlib import contextmanager
 import math
+from pathlib import Path
 
-from bench.luinv.rawhip import RawHIPModule
+from pyfr.util import digest
+
+from bench.luinv.rawhip import RawHIPModule, standalone
+
+
+# Sources of the kernels which PyFR generates
+SRC_DIR = Path(__file__).parent / 'build' / 'src'
 
 
 @contextmanager
@@ -17,13 +24,13 @@ def record_kernels(backend):
 
     def build_kernel(name, src, argtypes, *args, **kwargs):
         fun = build(name, src, argtypes, *args, **kwargs)
-        names[id(fun)] = name
+        names[id(fun)] = name, save_source(name, src)
         return fun
 
     def instantiate_kernel(dims, fun, args, meta):
-        name = names.get(id(fun))
+        name, path = names.get(id(fun), (None, None))
         kernels.append(describe(fun, meta['block'], name, dims=list(dims),
-                                compiler='hiprtc'))
+                                compiler='hiprtc', source=path))
         return instantiate(dims, fun, args, meta)
 
     # Hand written HIP kernels report themselves when made
@@ -47,6 +54,16 @@ def record_kernels(backend):
     finally:
         del prov._build_kernel, prov._instantiate_kernel
         RawHIPModule.kernel = raw
+
+
+def save_source(name, src):
+    # Keep the exact source given to HIPRTC as a standalone .hip file
+    path = SRC_DIR / f'{name}-{digest(src)[:16]}' / f'{name}.hip'
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(standalone(src))
+
+    return str(path)
 
 
 def describe(fun, block, name=None, **kwargs):

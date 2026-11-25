@@ -63,6 +63,10 @@ RUN if getent passwd ubuntu >/dev/null && [ "$(id -u ubuntu)" = "${UID}" ]; then
 # h5py is built against system parallel-capable HDF5 only if you set
 # HDF5_MPI=ON; the default wheel is fine for PyFR.
 RUN python3 -m venv /opt/venv && chown -R ${UID}:${GID} /opt/venv
+# rocprof-compute analyze pins numpy/pandas versions that clash with PyFR's,
+# so it gets a venv of its own (used by bench/luinv/analysis/roofline.py).
+RUN python3 -m venv /opt/rocprof-compute-venv \
+ && chown -R ${UID}:${GID} /opt/rocprof-compute-venv
 ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${PATH}
 USER ${UID}:${GID}
 RUN pip install \
@@ -70,6 +74,9 @@ RUN pip install \
       "platformdirs>=2.2.0" "mpi4py>=4.0.0" \
       pytest pytest-xdist ipython \
       scipy pandas matplotlib
+RUN /opt/rocprof-compute-venv/bin/pip install \
+      -r /opt/rocm/libexec/rocprofiler-compute/requirements.txt
+ENV LUINV_ROCPROF_PYTHON=/opt/rocprof-compute-venv/bin/python
 
 # ROCm / PyFR environment. PyFR dlopens libamdhip64, libhiprtc, librocblas and
 # librocprofiler-sdk-roctx by soname, so /opt/rocm/lib must be on the loader path.

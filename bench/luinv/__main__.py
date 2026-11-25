@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -278,6 +279,118 @@ def _add_hipcc_commands(sub):
     ap.set_defaults(func=cmd_hipcc)
 
 
+# Static analysis and profiling
+
+def _case_argv(args):
+    return ['--variant', args.variant, '--n', str(args.n),
+            '--precision', args.precision, '--neles', str(args.neles),
+            '--ncolours', str(args.ncolours), '--kind', args.kind,
+            '--scale', str(args.scale), '--seed', str(args.seed),
+            '--backend', args.backend, '--fpprec', args.fpprec,
+            '--memory-model', args.memory_model]
+
+
+def cmd_resources(args):
+    from bench.luinv.analysis.isa import assembly_file, isa_stats
+    from bench.luinv.problem import make_backend
+    from bench.luinv.rawhip import RawHIPModule
+
+    # Build every kernel of the variant offline with hipcc
+    os.environ['LUINV_COMPILER'] = 'hipcc'
+    case = _case(args)
+    res = harness.run_check(case, nsample=4)
+    backend = make_backend(case.backend, case.fpprec, case.memory_model)
+
+    rows = []
+    for k in res['kernels']:
+        if k.get('source'):
+            mod = RawHIPModule(backend, k['source'], compiler='hipcc')
+            adir, hipcc = mod.artifacts, mod.remarks().get(k['name'], {})
+        else:
+            adir, hipcc = k['artifacts'], k['hipcc'] or {}
+
+        rows.append({'kernel': k['name'], 'grid': k['dims'][0],
+                     'block': k['block'][0], 'artifacts': str(adir),
+                     **hipcc, **isa_stats(assembly_file(adir), k['name'])})
+
+    for r in rows:
+        print(f"{r['kernel']} (grid {r['grid']}, block {r['block']})")
+        for key, val in r.items():
+            if key not in ('kernel', 'grid', 'block'):
+                print(f'  {key}: {val}')
+
+    _emit({'mode': 'resources', 'case': res['case'], 'env': res['env'],
+           'kernels': rows}, args.out)
+
+
+def cmd_counters(args):
+    from bench.luinv.analysis.profile import GROUPS, collect
+
+    case = _case(args)
+    groups = GROUPS if args.groups == 'all' else {
+        g: GROUPS[g] for g in args.groups.split(',')
+    }
+    outdir = args.outdir or (RESULTS / 'profile' /
+                             case.label().replace(':', '_'))
+
+    kernels = collect(_case_argv(args), outdir, groups)
+
+    nominal = harness.nominal_flops(case.n)
+    for name, c in kernels.items():
+        print(f"{name}: {c['duration_s']*1e3:.3f} ms per dispatch")
+        if 'flops_f64' in c or 'flops_f32' in c:
+            # Each dispatch inverts at most a launch's worth of matrices
+            flops = c.get('flops_f64') or c.get('flops_f32')
+            print(f'  measured FLOPs per dispatch {flops:.3e}')
+        for key in ('tflops_f64', 'tflops_f32', 'fabric_gbs',
+                    'intensity_fabric', 'l2_hit_pct', 'valu_active_pct',
+                    'lds_active_pct', 'wait_inst_pct', 'wait_any_pct',
+                    'lds_conflict_cycles_per_inst'):
+            if c.get(key) is not None:
+                print(f'  {key}: {c[key]:.3f}')
+
+    _emit({'mode': 'counters', 'case': asdict(case),
+           'nominal_flops_per_matrix': nominal, 'kernels': kernels,
+           'outdir': str(outdir)}, args.out)
+
+
+def cmd_roofline(args):
+    from bench.luinv.analysis import roofline
+
+    case = _case(args)
+    workdir = args.outdir or (RESULTS / 'rocprof-compute' /
+                              case.label().replace(':', '_'))
+
+    print(f'Profiling into {workdir} (this replays the case many times)')
+    roofline.profile(_case_argv(args), workdir, 'luinv', kernel=args.kernel,
+                     roof_only=args.roof_only)
+    out = roofline.analyze(workdir)
+    print(f'Analysis in {out}; plots and raw data under {workdir}')
+
+
+def _add_analysis_commands(sub):
+    ap = sub.add_parser('resources', help='hipcc resource usage and ISA '
+                        'statistics of the kernels of a variant')
+    _case_args(ap)
+    ap.set_defaults(func=cmd_resources)
+
+    ap = sub.add_parser('counters', help='hardware counters through '
+                        'rocprofv3, one pass per counter group')
+    _case_args(ap)
+    ap.add_argument('--groups', default='all',
+                    help='comma separated counter groups, or all')
+    ap.add_argument('--outdir', type=Path)
+    ap.set_defaults(func=cmd_counters)
+
+    ap = sub.add_parser('roofline', help='rocprof-compute profile with '
+                        'empirical roofline, then analyze')
+    _case_args(ap)
+    ap.add_argument('--kernel', help='kernel name filter')
+    ap.add_argument('--roof-only', action='store_true')
+    ap.add_argument('--outdir', type=Path)
+    ap.set_defaults(func=cmd_roofline)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m bench.luinv')
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -285,6 +398,7 @@ def main(argv=None):
     _add_case_commands(sub)
     _add_benchmark_commands(sub)
     _add_hipcc_commands(sub)
+    _add_analysis_commands(sub)
 
     args = ap.parse_args(argv)
     return args.func(args)

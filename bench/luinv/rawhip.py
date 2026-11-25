@@ -43,6 +43,12 @@ def hipcc_compatible(src):
                   flags=re.M)
 
 
+def standalone(src):
+    """Wrap generated kernel source as a self contained .hip file."""
+    return ('#if !defined(__HIPCC_RTC__)\n#include <hip/hip_runtime.h>\n'
+            '#endif\n\nextern "C"\n{\n' + hipcc_compatible(src) + '\n}\n')
+
+
 class RawHIPKernel(HIPKernel):
     def __init__(self, fun, grid, block, sharedb=0):
         super().__init__()
