@@ -42,13 +42,13 @@ void lu_build_hip_v2(ixdtype_t nx, LUINV_SCALE_T scale,
     );
 }
 
-extern "C" __global__ __launch_bounds__(256, LUINV_K1MB)
+extern "C" __global__ __launch_bounds__(64*LUINV_K1W, LUINV_K1MB)
 void lu_factor_mfma_hip_v2(ixdtype_t _nx, const ixdtype_t* __restrict__ wk_v,
                            luinv_ftype* __restrict__ ws_v,
                            int16_t* __restrict__ perm_v,
                            unsigned long long* __restrict__ ticks)
 {
-    luinv::lu_factor<LUINV_NP, LUINV_WSZ, 4, LUINV_S>(
+    luinv::lu_factor<LUINV_NP, LUINV_WSZ, LUINV_K1W, LUINV_S>(
         ixdtype_t(LUINV_BLOCK_ID), wk_v, ws_v, perm_v, ticks
     );
 }

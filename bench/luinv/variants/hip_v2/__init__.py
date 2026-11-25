@@ -3,9 +3,9 @@
 Where the factorisation is in fp64 or fp32 the kernels are hand written
 with MFMA (see include/luinv/hip_v2): lu_build forms I - scale*src in a
 strip-major workspace, lu_factor_mfma factorises it left-looking with a
-block of four waves per matrix, leaving the factor packed for the MFMA, and
-lu_solve_mfma solves for 16 columns of the inverse per wave.  The matrices
-are padded to a multiple of 16 for them.
+block of four or eight waves per matrix, leaving the factor packed for the
+MFMA, and lu_solve_mfma solves for 16 columns of the inverse per wave.  The
+matrices are padded to a multiple of 16 for them.
 
 Otherwise both kernels come from the rendering of the frozen baseline
 template with the quick wins of hip_opt applied for the size, split at the
@@ -19,6 +19,7 @@ Options (environment variables, overriding the size policy):
                       their loads of the factor
   LUINV_K1_MINBLK=<n> launch bounds minimum blocks per CU of the mfma
                       factorisation
+  LUINV_K1_WAVES=<n>  waves per block of the mfma factorisation
   LUINV_K2_MINBLK=<n> launch bounds minimum blocks per CU of the solves
   LUINV_NWORK=<n>     most matrices factorised at once on the mfma path
   LUINV_STRIPS=<n>    strips of 16 columns per pass of the factorisation
@@ -75,13 +76,15 @@ def options(tplargs):
         nb = t['npad'] // 16
 
         # Blocks per CU as the registers allow, fp32 taking half as many,
-        # and two strips per pass of the factorisation for big matrices
+        # and for big matrices two strips per pass of the factorisation and
+        # eight waves to a block, cutting the latency of each matrix
         small, f32 = nb <= 20, t['ftype'] == 'float'
-        k1minblk = (3 if small else 2) if f32 else (2 if small else 1)
+        k1minblk = (3 if f32 else 2) if small else 1
         return {
             'path': path,
             'wpb': int(env.get('LUINV_WPB', 4)),
             'k1minblk': int(env.get('LUINV_K1_MINBLK', k1minblk)),
+            'k1w': int(env.get('LUINV_K1_WAVES', 4 if small else 8)),
             'strips': int(env.get('LUINV_STRIPS', 1 if small else 2)),
             'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if small else 1))
         }
@@ -237,7 +240,8 @@ class LUInverse(BaselineLUInverse):
             defs = {
                 'LUINV_MFMA': 1, 'LUINV_N': t['n'], 'LUINV_NP': t['npad'],
                 'LUINV_WSZ': f"{t['wsz']}LL", 'LUINV_WPB': opts['wpb'],
-                'LUINV_K1MB': opts['k1minblk'], 'LUINV_S': opts['strips'],
+                'LUINV_K1MB': opts['k1minblk'], 'LUINV_K1W': opts['k1w'],
+                'LUINV_S': opts['strips'],
                 'LUINV_K2MB': opts['k2minblk'], 'LUINV_TR': out.trows,
                 'LUINV_TC': out.tcols, 'LUINV_PADC': out.padc,
                 'LUINV_NDIES': b.ndies, 'LUINV_FTYPE': t['ftype'],
@@ -271,7 +275,7 @@ class LUInverse(BaselineLUInverse):
                                        PTR, PTR],
                                (-(-s // 64)*t['npad'], 1, 1), (256, 1, 1)),
                     mod.kernel(FACTOR_MFMA, [b.ixdtype, PTR, PTR, PTR, PTR],
-                               (s, 1, 1), (256, 1, 1)),
+                               (s, 1, 1), (64*self.opts['k1w'], 1, 1)),
                     mod.kernel(SOLVE_MFMA, [b.ixdtype] + [PTR]*5,
                                (s*-(-nb // wpb), 1, 1), (64*wpb, 1, 1))
                 ]
