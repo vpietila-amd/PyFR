@@ -20,6 +20,9 @@ namespace luinv
 template<typename T>
 using vec4 = T __attribute__((ext_vector_type(4)));
 
+template<typename T>
+using vec2 = T __attribute__((ext_vector_type(2)));
+
 typedef vec4<double> f64x4;
 typedef vec4<float> f32x4;
 

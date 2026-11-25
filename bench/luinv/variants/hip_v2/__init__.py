@@ -28,6 +28,7 @@ Options (environment variables, overriding the size policy):
   LUINV_PIVOT=<mode>  generated pivot arg-max: shfl (default) or lds
   LUINV_IX32=0|1      generated: hoist the int64 workspace base out of the
                       indices
+  LUINV_DEFS=A=1,B    extra macros for the mfma kernels, for experiments
 """
 from functools import cached_property
 from pathlib import Path
@@ -254,6 +255,11 @@ class LUInverse(BaselineLUInverse):
             }
             if os.environ.get('LUINV_PHASES'):
                 defs['LUINV_PHASES'] = 1
+
+            # Extra macros for experiments, as LUINV_DEFS=A=1,B
+            for d in filter(None, os.environ.get('LUINV_DEFS', '').split(',')):
+                k, _, v = d.partition('=')
+                defs[k] = v or 1
         else:
             hdr = generate(b, t, opts)
             defs = {'LUINV_HEADER': hdr.name}

@@ -38,10 +38,34 @@ __device__ __forceinline__ int sm_ix(int r, int c)
     return NP*16*(c / 16) + 16*r + c % 16;
 }
 
+// Two consecutive entries of src from p, aligned to their size, as T, not
+// kept in the caches
+template<typename T, typename ST>
+__device__ __forceinline__ vec2<T> load_pair(const ST* p)
+{
+    if constexpr (__is_same(ST, bf16))
+    {
+        auto u = __builtin_nontemporal_load(
+            reinterpret_cast<const unsigned*>(p)
+        );
+        return {cvt<T>(bf16{(unsigned short) u}),
+                cvt<T>(bf16{(unsigned short) (u >> 16)})};
+    }
+    else
+    {
+        auto v = __builtin_nontemporal_load(
+            reinterpret_cast<const vec2<ST>*>(p)
+        );
+        return {cvt<T>(v[0]), cvt<T>(v[1])};
+    }
+}
+
 // Fill the strip-major workspaces with A = I - scale*src, in T, for one row
-// of the 64 matrices of an AoSoA group of src per block of 256 lanes,
-// staging 16 columns at a time through LDS so both the loads and stores
-// coalesce
+// of the 64 matrices of an AoSoA group of src per block of four waves.  Each
+// wave takes 16 of the matrices, 16 columns at a time, transposing them
+// through its own LDS: it loads them two matrices a lane, so the loads of a
+// column coalesce, and stores them two columns a lane, so those of a matrix
+// do.  The groups of src are whole, so the loads need no guard past nx.
 template<int N, int NP, long long WSZ, typename T, typename ST, typename FT,
          typename IX>
 __device__ __forceinline__ void lu_build(
@@ -49,34 +73,54 @@ __device__ __forceinline__ void lu_build(
     const IX* __restrict__ wk_v, T* __restrict__ ws_v)
 {
     constexpr int SOA = 64;
-    __shared__ T st[16][SOA + 1];
+    __shared__ T stw[4][16][17];
 
     const IX g = b / NP;
-    const int r = int(b % NP), t = threadIdx.x;
+    const int r = int(b % NP), lane = threadIdx.x % 64, w = threadIdx.x / 64;
     const T scl = T(scale);
+    T (*st)[17] = stw[w];
+
+    // Order the LDS accesses of the wave, which needs no barrier
+    auto wave_sync = []()
+    {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    };
 
     for (int c0 = 0; c0 < NP; c0 += 16)
     {
-        // Load entry (r, c0 + c) of the matrices of the group
-        for (int i = t; i < 16*SOA; i += 256)
+        // Entries (r, c0 + i/8) of matrices 2(i % 8) and 2(i % 8) + 1
+        vec2<T> v[2];
+#pragma unroll
+        for (int u = 0; u < 2; u++)
         {
-            int c = c0 + i / SOA, xm = i % SOA;
-            T v = 0;
+            int i = lane + 64*u, c = c0 + i / 8, xm = 16*w + 2*(i % 8);
+            v[u] = vec2<T>{0, 0};
             if (r < N && c < N && SOA*g + xm < nx)
-                v = cvt<T>(src_v[ldsrc*r + (g*N + c)*SOA + xm]);
-            st[i / SOA][xm] = T(r == c) - scl*v;
+                v[u] = load_pair<T>(&src_v[ldsrc*r + (g*N + c)*SOA + xm]);
         }
-        __syncthreads();
-
-        // Store them a run of 16 columns per matrix
-        for (int i = t; i < 16*SOA; i += 256)
+#pragma unroll
+        for (int u = 0; u < 2; u++)
         {
-            int xm = i / 16, c = i % 16;
-            IX x = SOA*g + xm;
-            if (x < nx)
-                ws_v[wk_v[x]*WSZ + sm_ix<NP>(r, c0 + c)] = st[c][xm];
+            int i = lane + 64*u, c = c0 + i / 8, xl = 2*(i % 8);
+            st[i / 8][xl] = T(r == c) - scl*v[u][0];
+            st[i / 8][xl + 1] = T(r == c) - scl*v[u][1];
         }
-        __syncthreads();
+        wave_sync();
+
+        // Entries (r, c0 + 2(i % 8)) and the next of matrix i/8
+#pragma unroll
+        for (int u = 0; u < 2; u++)
+        {
+            int i = lane + 64*u, xl = i / 8, c = 2*(i % 8);
+            IX x = SOA*g + 16*w + xl;
+            if (x < nx)
+                *reinterpret_cast<vec2<T>*>(
+                    &ws_v[wk_v[x]*WSZ + sm_ix<NP>(r, c0 + c)]
+                ) = vec2<T>{st[c][xl], st[c + 1][xl]};
+        }
+        wave_sync();
     }
 }
 
