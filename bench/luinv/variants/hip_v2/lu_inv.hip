@@ -48,7 +48,7 @@ void lu_factor_mfma_hip_v2(ixdtype_t _nx, const ixdtype_t* __restrict__ wk_v,
                            int16_t* __restrict__ perm_v,
                            unsigned long long* __restrict__ ticks)
 {
-    luinv::lu_factor<LUINV_NP, LUINV_WSZ, LUINV_K1W, LUINV_S>(
+    luinv::lu_factor<LUINV_NP, LUINV_WSZ, LUINV_K1W, LUINV_S, LUINV_IOL>(
         ixdtype_t(LUINV_BLOCK_ID), wk_v, ws_v, perm_v, ticks
     );
 }

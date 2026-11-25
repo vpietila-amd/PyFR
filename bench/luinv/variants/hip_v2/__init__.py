@@ -23,6 +23,8 @@ Options (environment variables, overriding the size policy):
   LUINV_K2_MINBLK=<n> launch bounds minimum blocks per CU of the solves
   LUINV_NWORK=<n>     most matrices factorised at once on the mfma path
   LUINV_STRIPS=<n>    strips of 16 columns per pass of the factorisation
+  LUINV_INV_OOL=0|1   invert the diagonal blocks out of line, apart from the
+                      registers of the updates
   LUINV_MINBLK=<n>    the same as LUINV_K2_MINBLK for the generated
                       factorisation
   LUINV_PIVOT=<mode>  generated pivot arg-max: shfl (default) or lds
@@ -68,7 +70,7 @@ def mfma_path(t):
     return t['ftype'] in ('double', 'float')
 
 
-def options(tplargs):
+def options(tplargs, ncu=304):
     """The options for the size, overridden by the environment."""
     env, t = os.environ, tplargs
 
@@ -78,15 +80,32 @@ def options(tplargs):
 
         # Blocks per CU as the registers allow, fp32 taking half as many,
         # and for big matrices two strips per pass of the factorisation and
-        # eight waves to a block, cutting the latency of each matrix
+        # eight waves to a block, cutting the latency of each matrix.
+        #
+        # Inverting the diagonal blocks out of line (iol) frees registers
+        # for more blocks, except in fp64 above 16 strips where the updates
+        # take nearly them all.  A launch of at most three matrices per CU
+        # gains nothing from more blocks, and in fp64 then loses to the
+        # cost.  Not with eight waves: at n=625 the factorisation then goes
+        # wrong with pivoting, under HIPRTC and hipcc alike (it spills and
+        # calls two functions), for at best 2%.
         small, f32 = nb <= 20, t['ftype'] == 'float'
-        k1minblk = (3 if f32 else 2) if small else 1
+        few = t['nwork'] <= 3*ncu
+        if not small:
+            k1minblk, iol = 1, False
+        elif few and not f32:
+            k1minblk, iol = 2, False
+        else:
+            k1minblk = 4 if nb <= 8 else 3 if f32 else 2
+            iol = f32 or nb <= 16
+
         return {
             'path': path,
             'wpb': int(env.get('LUINV_WPB', 4)),
             'k1minblk': int(env.get('LUINV_K1_MINBLK', k1minblk)),
             'k1w': int(env.get('LUINV_K1_WAVES', 4 if small else 8)),
             'strips': int(env.get('LUINV_STRIPS', 1 if small else 2)),
+            'iol': int(env.get('LUINV_INV_OOL', iol)),
             'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if small else 1))
         }
 
@@ -219,7 +238,7 @@ class LUInverse(BaselineLUInverse):
 
     @cached_property
     def opts(self):
-        return options(self.tplargs)
+        return options(self.tplargs, self.backend.props['multiprocessor_count'])
 
     @cached_property
     def ticks(self):
@@ -242,7 +261,7 @@ class LUInverse(BaselineLUInverse):
                 'LUINV_MFMA': 1, 'LUINV_N': t['n'], 'LUINV_NP': t['npad'],
                 'LUINV_WSZ': f"{t['wsz']}LL", 'LUINV_WPB': opts['wpb'],
                 'LUINV_K1MB': opts['k1minblk'], 'LUINV_K1W': opts['k1w'],
-                'LUINV_S': opts['strips'],
+                'LUINV_S': opts['strips'], 'LUINV_IOL': opts['iol'],
                 'LUINV_K2MB': opts['k2minblk'], 'LUINV_TR': out.trows,
                 'LUINV_TC': out.tcols, 'LUINV_PADC': out.padc,
                 'LUINV_NDIES': b.ndies, 'LUINV_FTYPE': t['ftype'],

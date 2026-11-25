@@ -219,6 +219,17 @@ __device__ __forceinline__ void invert_diag(const T* d, const T* idg,
     }
 }
 
+// invert_diag out of line, its registers then apart from those of the
+// updates: fewer at the peak of the factorisation, though the updates
+// around the call may be scheduled worse
+template<typename T>
+__device__ __noinline__ void invert_diag_ool(const T* d, const T* idg,
+                                             int lane, bool lower, T* linv,
+                                             T* uinv)
+{
+    invert_diag(d, idg, lane, lower, linv, uinv);
+}
+
 // Make the global and LDS stores of the block visible to all of its lanes
 __device__ __forceinline__ void block_sync()
 {
@@ -429,8 +440,10 @@ __device__ __noinline__ void factor_panel(
 // before it to all its strips at once, each operand serving all of them,
 // then factorises its strips in turn, applying those of the pass before.
 //
-// The panel is spread over all the lanes too; see factor_panel.
-template<int NP, long long WSZ, int W, int S, typename T, typename IX>
+// The panel is spread over all the lanes too; see factor_panel.  IOL keeps
+// the inversions of the diagonal blocks out of line.
+template<int NP, long long WSZ, int W, int S, bool IOL, typename T,
+         typename IX>
 __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                                           T* __restrict__ ws_v,
                                           short* __restrict__ perm_v,
@@ -688,8 +701,14 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
             __syncthreads();
 
             if (w < 2)
-                invert_diag(dg, idg, lane, w == 0, a + pk_block<NB>(k, k),
-                            uinv + 256*k);
+            {
+                if constexpr (IOL)
+                    invert_diag_ool(dg, idg, lane, w == 0,
+                                    a + pk_block<NB>(k, k), uinv + 256*k);
+                else
+                    invert_diag(dg, idg, lane, w == 0,
+                                a + pk_block<NB>(k, k), uinv + 256*k);
+            }
             block_sync();
 
             LUINV_TICK(8);

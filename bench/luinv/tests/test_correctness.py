@@ -37,6 +37,10 @@ FULL = [
     *[(n, p, k, 65, 1) for n, p, k in it.product(
         (100, 175, 320, 625), ('double', 'single', 'half', 'bf16'), KINDS
     )],
+    # The other regimes of the size policy of hip_v2
+    *[(n, p, k, 65, 1) for n, p, k in it.product(
+        (70, 250), ('double', 'single'), KINDS
+    )],
     *[(175, 'double', 'jacobian', e, 1)
       for e in (1, 7, 63, 64, 65, 512, 513, 1500)],
     (320, 'double', 'jacobian', 4096, 8),
