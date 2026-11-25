@@ -1,0 +1,35 @@
+// PyFR HIP backend development container (ROCm 10.2, MI300X / gfx942).
+// See .devcontainer/README.md.  RENDER_GID must match the GID of the host's
+// `render` group (`getent group render`); export it before opening the folder
+// in the container if it differs from the default of 109.
+{
+  "name": "PyFR HIP (ROCm 10.2, gfx942)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "args": {
+      "UID": "1000",
+      "GID": "1000",
+      "USERNAME": "dev",
+      "RENDER_GID": "${localEnv:RENDER_GID:109}",
+      "GPU_ARCH": "gfx942"
+    }
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/PyFR,type=bind",
+  "workspaceFolder": "/workspace/PyFR",
+  "runArgs": [
+    "--device=/dev/kfd", "--device=/dev/dri",
+    "--group-add=video", "--group-add=render",
+    "--security-opt=seccomp=unconfined",
+    "--cap-add=SYS_PTRACE",
+    "--ipc=host", "--init"
+  ],
+  "postCreateCommand": "pip install -e /workspace/PyFR --no-deps",
+  "remoteUser": "dev",
+  "updateRemoteUserUID": true,
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-vscode.cpptools"]
+    }
+  }
+}
