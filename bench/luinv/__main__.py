@@ -391,6 +391,77 @@ def _add_analysis_commands(sub):
     ap.set_defaults(func=cmd_roofline)
 
 
+# Search-driven tuning of the hip_opt knobs
+
+def cmd_tune(args):
+    from bench.luinv.tune import load_tuning_search, make_backend_and_space
+
+    ts = load_tuning_search()
+    case = harness.Case(n=args.n, neles=args.neles, ncolours=args.ncolours,
+                        precision=args.precision, kind=args.kind,
+                        scale=args.scale, seed=args.seed, variant='hip_opt',
+                        backend=args.backend, fpprec=args.fpprec,
+                        memory_model=args.memory_model)
+
+    backend, space, baseline = make_backend_and_space(case, ts,
+                                                      nsample=args.nsample)
+    budget = ts.Budget(evaluations=args.budget) if args.budget else None
+    ladder = (ts.Fidelity(reps=args.reps, warmup=args.warmup),)
+
+    res = ts.tune(space, backend, strategy=args.strategy, budget=budget,
+                  ladder=ladder, reject_spill=False, baseline=baseline,
+                  environment=backend.environment(),
+                  cache_path=args.cache, trace=args.trace)
+
+    print(f'{case.label()}  strategy={res.strategy}  '
+          f'evaluations={res.evaluations}')
+    print(f'  best config: {res.best_config}')
+    print(f'  best time:   {res.best_value*1e3:.3f} ms')
+    if res.confirmed:
+        sp = res.confirmed.get('speedup')
+        pv = res.confirmed.get('p_value')
+        sp = f'{sp:.3f}x' if sp is not None else 'n/a'
+        pv = f'{pv:.3g}' if pv is not None else 'n/a'
+        print(f'  vs baseline: speedup {sp}  (p={pv})')
+
+    _emit({'mode': 'tune', 'case': asdict(case), 'strategy': res.strategy,
+           'evaluations': res.evaluations, 'best_config': res.best_config,
+           'best_value_s': res.best_value, 'confirmed': res.confirmed},
+          args.out)
+
+    return 0
+
+
+def _add_tune_commands(sub):
+    ap = sub.add_parser('tune', help='search the hip_opt knobs with the '
+                        'tuning-search framework')
+    ap.add_argument('--n', type=int, default=320)
+    ap.add_argument('--precision', default='double', choices=PRECISIONS)
+    ap.add_argument('--neles', type=int, default=512)
+    ap.add_argument('--ncolours', type=int, default=1)
+    ap.add_argument('--kind', default='jacobian', choices=KINDS)
+    ap.add_argument('--scale', type=float, default=0.05)
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--backend', default='hip')
+    ap.add_argument('--fpprec', default='double', help='backend precision')
+    ap.add_argument('--memory-model', default='normal',
+                    choices=['normal', 'large'])
+    ap.add_argument('--strategy', default='exhaustive',
+                    help='search strategy (exhaustive, hill, portfolio, ...)')
+    ap.add_argument('--budget', type=int, default=0,
+                    help='max evaluations (0 = framework default)')
+    ap.add_argument('--reps', type=int, default=20)
+    ap.add_argument('--warmup', type=int, default=3)
+    ap.add_argument('--nsample', type=int, default=32,
+                    help='matrices checked per colour')
+    ap.add_argument('--cache', type=Path,
+                    help='persistent evaluation cache (JSON)')
+    ap.add_argument('--trace', type=Path, help='search trace (JSONL)')
+    ap.add_argument('--out', type=Path,
+                    help='append the result as a JSON line to this file')
+    ap.set_defaults(func=cmd_tune)
+
+
 # Phases of the baseline kernel
 
 def cmd_phases(args):
@@ -427,6 +498,7 @@ def main(argv=None):
     _add_benchmark_commands(sub)
     _add_hipcc_commands(sub)
     _add_analysis_commands(sub)
+    _add_tune_commands(sub)
     _add_phase_commands(sub)
 
     args = ap.parse_args(argv)

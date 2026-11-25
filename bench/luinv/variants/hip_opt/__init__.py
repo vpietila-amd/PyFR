@@ -217,3 +217,19 @@ class LUInverse(BaselineLUInverse):
             kern.set_args(inv.n, scale, *inv.kargs('v'), self.perm,
                           *src.kargs('ml'), self.wk, self.ws)
             self.backend.run_kernels([kern])
+
+
+def variant_with_opts(opts):
+    """A LUInverse subclass whose opts are fixed, not read from the
+    environment.  Lets one process compile and compare several knob
+    configurations, as the tuning search does; the environment path on the
+    plain ``LUInverse`` is unchanged.
+    """
+    fixed = dict(opts)
+
+    class _LUInverse(LUInverse):
+        @cached_property
+        def opts(self):
+            return dict(fixed)
+
+    return _LUInverse
