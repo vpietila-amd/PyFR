@@ -19,6 +19,8 @@ Options (environment variables, overriding the size policy):
                       factorisation
   LUINV_K2_MINBLK=<n> launch bounds minimum blocks per CU of the solves
   LUINV_NWORK=<n>     most matrices factorised at once on the mfma path
+  LUINV_SOLVE_SHARED=0|1  mfma solves sharing the loads of the factor
+                      between the waves of a block through LDS
   LUINV_MINBLK=<n>    the same as LUINV_K2_MINBLK for the generated
                       factorisation
   LUINV_PIVOT=<mode>  generated pivot arg-max: shfl (default) or lds
@@ -63,13 +65,18 @@ def options(tplargs):
     path = env.get('LUINV_PATH', 'mfma' if mfma_path(t) else 'gen')
     if path == 'mfma':
         nb = t['npad'] // 16
-        wpb = next(w for w in (4, 2, 1) if nb % w == 0)
+        shared = env.get('LUINV_SOLVE_SHARED', '1') not in ('', '0')
+
+        # Waves per block of the solves: sharing their loads, or splitting
+        # the column blocks evenly
+        wpb = 4 if shared else next(w for w in (4, 2, 1) if nb % w == 0)
 
         # Two waves per SIMD while the tiles of Z fit in half the registers
         return {
             'path': path,
             'wpb': int(env.get('LUINV_WPB', wpb)),
             'k1minblk': int(env.get('LUINV_K1_MINBLK', 2 if nb <= 20 else 1)),
+            'shared': shared,
             'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if nb <= 20 else 1))
         }
 
@@ -232,6 +239,8 @@ class LUInverse(BaselineLUInverse):
                     np.dtype(b.ixdtype).itemsize
                 ]
             }
+            if opts['shared']:
+                defs['LUINV_SOLVE_SHARED'] = 1
             if os.environ.get('LUINV_PHASES'):
                 defs['LUINV_PHASES'] = 1
         else:
@@ -257,7 +266,7 @@ class LUInverse(BaselineLUInverse):
                     mod.kernel(FACTOR_MFMA, [b.ixdtype, PTR, PTR, PTR, PTR],
                                (s, 1, 1), (256, 1, 1)),
                     mod.kernel(SOLVE_MFMA, [b.ixdtype] + [PTR]*5,
-                               (s*nb // wpb, 1, 1), (64*wpb, 1, 1))
+                               (s*-(-nb // wpb), 1, 1), (64*wpb, 1, 1))
                 ]
             else:
                 argt = [b.ixdtype, b.fpdtype, PTR, PTR, PTR, PTR, b.ixdtype,

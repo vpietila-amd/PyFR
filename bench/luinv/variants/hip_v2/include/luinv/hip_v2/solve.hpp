@@ -113,6 +113,112 @@ __device__ __forceinline__ void solve_columns(const double* pk, int cb,
     }
 }
 
+// The same for the WPB waves of a block, each from column block cb0 + w,
+// sharing the loads of the factor through LDS.  A sweep goes a column of
+// blocks of the factor at a time, the inverse of the diagonal block first,
+// in chunks of WPB blocks; each wave fetches one block of the next chunk
+// while the current one is applied, so each chunk takes one barrier.
+template<int NB, int WPB>
+__device__ __forceinline__ void solve_columns_shared(const double* pk,
+                                                     int cb0, int w,
+                                                     int lane,
+                                                     f64x4 (&z)[NB])
+{
+    __shared__ f64x4 st[2][WPB][64];
+
+    const int cb = cb0 + w;
+    const f64x4 zero = {0, 0, 0, 0};
+
+    // Start from the columns of the identity
+#pragma unroll
+    for (int j = 0; j < NB; j++)
+    {
+#pragma unroll
+        for (int v = 0; v < 4; v++)
+            z[j][v] = (j == cb && mfma_crow(lane, v) == mfma_lrow(lane));
+    }
+
+    // Block m of column i of the forward or backward sweep, and their count
+    auto item = [&](bool fwd, int i, int m)
+    {
+        if (fwd)
+            return pk + pk_block<NB>(i + m, i);
+        else
+            return pk + (m == 0 ? pk_uinv<NB>(i) : pk_block<NB>(m - 1, i));
+    };
+    auto count = [](bool fwd, int i) { return fwd ? NB - i : i + 1; };
+
+    f64x4 pf;
+    auto fetch = [&](bool fwd, int i, int c)
+    {
+        int m = WPB*c + w;
+        if (m < count(fwd, i))
+            pf = load_a(item(fwd, i, m), lane);
+    };
+
+    // Apply chunk c of column i, then fetch the next chunk
+    int buf = 0;
+    auto chunk = [&](bool fwd, int i, int c, bool active)
+    {
+        if (WPB*c + w < count(fwd, i))
+            st[buf][w][lane] = pf;
+        __syncthreads();
+
+        // Fetch the next chunk: of this column, the next column, or the
+        // first column of the backward sweep
+        if (WPB*(c + 1) < count(fwd, i))
+            fetch(fwd, i, c + 1);
+        else if (fwd && i + 1 < NB)
+            fetch(true, i + 1, 0);
+        else if (fwd)
+            fetch(false, NB - 1, 0);
+        else if (i > 0)
+            fetch(false, i - 1, 0);
+
+        if (active)
+        {
+#pragma unroll
+            for (int u = 0; u < WPB; u++)
+            {
+                const int m = WPB*c + u;
+                if (m >= count(fwd, i))
+                    break;
+
+                const f64x4 a = st[buf][u][lane];
+                if (m == 0)
+                    z[i] = mma_a<false>(a, z[i], zero);
+                else if (fwd)
+                    z[i + m] = mma_a<true>(a, z[i], z[i + m]);
+                else
+                    z[m - 1] = mma_a<true>(a, z[i], z[m - 1]);
+            }
+        }
+        buf ^= 1;
+    };
+
+    // Forward: L^-1 is lower triangular so the block rows above cb stay zero
+    fetch(true, cb0, 0);
+#pragma unroll
+    for (int i = 0; i < NB; i++)
+    {
+        if (i < cb0)
+            continue;
+
+#pragma unroll
+        for (int c = 0; WPB*c < NB - i; c++)
+            chunk(true, i, c, i >= cb);
+    }
+
+    // Backward
+#pragma unroll
+    for (int i = NB - 1; i >= 0; i--)
+    {
+#pragma unroll
+        for (int c = 0; WPB*c < i + 1; c++)
+            chunk(false, i, c, true);
+    }
+}
+
 // Index of element (r, c) of an inverse in PyFR's tiled matrices
 template<int TR, int TC, int PADC>
 __device__ __forceinline__ int tiled_ix(int r, int c)
@@ -120,7 +226,8 @@ __device__ __forceinline__ int tiled_ix(int r, int c)
     return (r / TR)*(PADC / TC)*TR*TC + (c / TC)*TR*TC + (r % TR)*TC + c % TC;
 }
 
-// One block of WPB waves per WPB*16 columns of one matrix
+// One block of WPB waves per WPB*16 columns of one matrix, the last block
+// of a matrix with fewer columns than that
 template<int N, int NP, long long WSZ, int WPB, int TR, int TC, int PADC,
          typename IX>
 __device__ __forceinline__ void lu_solve_mfma(
@@ -128,8 +235,7 @@ __device__ __forceinline__ void lu_solve_mfma(
     const short* __restrict__ perm_v, const IX* __restrict__ wk_v,
     const double* __restrict__ ws_v)
 {
-    constexpr int NB = NP/16, BPM = NB/WPB;
-    static_assert(NB % WPB == 0, "waves must split the column blocks");
+    constexpr int NB = NP/16, BPM = (NB + WPB - 1)/WPB;
 
     const int lane = threadIdx.x % 64;
     const IX x = b / BPM;
@@ -140,9 +246,18 @@ __device__ __forceinline__ void lu_solve_mfma(
     const short* perm = perm_v + wk*NP;
 
     f64x4 z[NB];
+#if defined(LUINV_SOLVE_SHARED)
+    solve_columns_shared<NB, WPB>(pk, cb - threadIdx.x / 64, threadIdx.x / 64,
+                                  lane, z);
+#else
     solve_columns<NB>(pk, cb, lane, z);
+#endif
 
-    // Write the columns out in pivoted order
+    // Write the columns out in pivoted order, with the waves of the last
+    // block past the end only having helped with the loads
+    if (cb >= NB)
+        return;
+
     const int gcol = perm[16*cb + mfma_lrow(lane)];
     if (gcol < N)
     {
