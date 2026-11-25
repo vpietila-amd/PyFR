@@ -16,6 +16,9 @@ _variants = {
 
     # Hand-written HIP optimisation playground, driven by LUINV_* env knobs
     'hip_opt': 'bench.luinv.variants.hip_opt:LUInverse',
+
+    # Split into a factorisation kernel and a column-chunk solve kernel
+    'hip_v2': 'bench.luinv.variants.hip_v2:LUInverse',
 }
 
 
