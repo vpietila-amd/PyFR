@@ -13,6 +13,9 @@ _variants = {
 
     # The same with the time spent in each phase recorded
     'hip_ref_phases': 'bench.luinv.variants.hip_ref:PhasedLUInverse',
+
+    # Hand-written HIP optimisation playground, driven by LUINV_* env knobs
+    'hip_opt': 'bench.luinv.variants.hip_opt:LUInverse',
 }
 
 
