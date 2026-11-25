@@ -1,5 +1,5 @@
-// LU factorisation with partial pivoting with fp64 MFMA, one wave per
-// matrix, for the solves of solve.hpp.
+// LU factorisation with partial pivoting with MFMA, in fp64 or fp32, for
+// the solves of solve.hpp.
 //
 // The workspace of a matrix holds it as NB = NP/16 strips of 16 columns,
 // each strip NP rows of 16 entries in a row (strip-major).  lu_build fills
@@ -11,7 +11,7 @@
 // and the blocks of L below it.  The inverses of the diagonal blocks of U
 // go after the strips.
 //
-// For strip k the wave
+// For strip k the block
 //   1. loads the strip in the current row order into accumulator tiles,
 //   2. applies the factored strips: Z_i = L_ii^-1 Z_i for the block rows
 //      i < k, each followed by Z_j -= L_ji Z_i for j > i,
@@ -26,6 +26,7 @@
 
 #include "luinv/hip_v2/mfma.hpp"
 #include "luinv/hip_v2/solve.hpp"
+#include "luinv/hip_v2/types.hpp"
 
 namespace luinv
 {
@@ -37,19 +38,22 @@ __device__ __forceinline__ int sm_ix(int r, int c)
     return NP*16*(c / 16) + 16*r + c % 16;
 }
 
-// Fill the strip-major workspaces with A = I - scale*src for one row of
-// the 64 matrices of an AoSoA group of src per block of 256 lanes, staging
-// 16 columns at a time through LDS so both the loads and stores coalesce
-template<int N, int NP, long long WSZ, typename IX>
+// Fill the strip-major workspaces with A = I - scale*src, in T, for one row
+// of the 64 matrices of an AoSoA group of src per block of 256 lanes,
+// staging 16 columns at a time through LDS so both the loads and stores
+// coalesce
+template<int N, int NP, long long WSZ, typename T, typename ST, typename FT,
+         typename IX>
 __device__ __forceinline__ void lu_build(
-    IX b, IX nx, double scale, const double* __restrict__ src_v, IX ldsrc,
-    const IX* __restrict__ wk_v, double* __restrict__ ws_v)
+    IX b, IX nx, FT scale, const ST* __restrict__ src_v, IX ldsrc,
+    const IX* __restrict__ wk_v, T* __restrict__ ws_v)
 {
     constexpr int SOA = 64;
-    __shared__ double st[16][SOA + 1];
+    __shared__ T st[16][SOA + 1];
 
     const IX g = b / NP;
     const int r = int(b % NP), t = threadIdx.x;
+    const T scl = T(scale);
 
     for (int c0 = 0; c0 < NP; c0 += 16)
     {
@@ -57,10 +61,10 @@ __device__ __forceinline__ void lu_build(
         for (int i = t; i < 16*SOA; i += 256)
         {
             int c = c0 + i / SOA, xm = i % SOA;
-            double v = 0;
+            T v = 0;
             if (r < N && c < N && SOA*g + xm < nx)
-                v = src_v[ldsrc*r + (g*N + c)*SOA + xm];
-            st[i / SOA][xm] = (r == c) - scale*v;
+                v = cvt<T>(src_v[ldsrc*r + (g*N + c)*SOA + xm]);
+            st[i / SOA][xm] = T(r == c) - scl*v;
         }
         __syncthreads();
 
@@ -78,9 +82,10 @@ __device__ __forceinline__ void lu_build(
 
 // Pivot search key of entry v of row r: the larger magnitude wins, then
 // the lower row; the low 12 bits of the magnitude make way for the row
-__device__ __forceinline__ unsigned long long pivot_key(double v, int r)
+template<typename T>
+__device__ __forceinline__ unsigned long long pivot_key(T v, int r)
 {
-    unsigned long long m = __double_as_longlong(fabs(v));
+    unsigned long long m = __double_as_longlong(fabs(double(v)));
     return (m & ~0xfffull) | (0xfffu - r);
 }
 
@@ -120,29 +125,21 @@ __device__ __forceinline__ unsigned long long wave_max(unsigned long long v)
     return (unsigned long long)(unsigned) lo | (unsigned long long) hi << 32;
 }
 
-// Broadcast the value of v in lane l, uniform across the wave
-__device__ __forceinline__ double read_lane(double v, int l)
-{
-    int lo = __builtin_amdgcn_readlane(__double2loint(v), l);
-    int hi = __builtin_amdgcn_readlane(__double2hiint(v), l);
-    return __hiloint2double(hi, lo);
-}
-
 // Invert a 16 x 16 diagonal block d (row major in LDS) into packed blocks,
 // lanes 0-15 of the first wave given taking the columns of L^-1, with L on
 // and below the diagonal of d, and those of the second the columns of
 // U^-1, with U unit upper above it.  idg holds the reciprocals of the
 // diagonal of d.
-__device__ __forceinline__ void invert_diag(const double* d,
-                                            const double* idg, int lane,
-                                            bool lower, double* linv,
-                                            double* uinv)
+template<typename T>
+__device__ __forceinline__ void invert_diag(const T* d, const T* idg,
+                                            int lane, bool lower, T* linv,
+                                            T* uinv)
 {
     const int c = lane % 16;
 
     // Column c of the inverse by substitution a column of d at a time, each
     // solved entry updating all the rows after it at once
-    double y[16];
+    T y[16];
 #pragma unroll
     for (int r = 0; r < 16; r++)
         y[r] = (r == c);
@@ -160,7 +157,7 @@ __device__ __forceinline__ void invert_diag(const double* d,
 
 #pragma unroll
         for (int r = 0; r < 16; r++)
-            linv[pk_ix(r, c)] = y[r];
+            linv[pk_ix<T>(r, c)] = y[r];
     }
     else if (!lower && lane < 16)
     {
@@ -174,7 +171,7 @@ __device__ __forceinline__ void invert_diag(const double* d,
 
 #pragma unroll
         for (int r = 0; r < 16; r++)
-            uinv[pk_ix(r, c)] = y[r];
+            uinv[pk_ix<T>(r, c)] = y[r];
     }
 }
 
@@ -205,21 +202,20 @@ __device__ __forceinline__ void block_sync()
 // it from there.  Then apply the row interchanges to the factored strips,
 // the npend strips after k waiting row major and the row order rord, store
 // the blocks of L below the diagonal packed and stage the diagonal block in
-// dg.  Kept out of line, as its registers are
-// separate from those of the updates.
-template<int NP, int W>
+// dg.  Kept out of line, as its registers are separate from those of the
+// updates.
+template<int NP, int W, typename T>
 __device__ __noinline__ void factor_panel(
-    double* a, int k, int npend, short* rord, int* ipiv,
-    double (*cand)[W][16], double (*grow)[16], unsigned long long (*ckey)[W],
-    double* dg)
+    T* a, int k, int npend, short* rord, int* ipiv, T (*cand)[W][16],
+    T (*grow)[16], unsigned long long (*ckey)[W], T* dg)
 {
     constexpr int NB = NP/16, NL = 64*W, NQ = (NP + NL - 1)/NL;
 
     const int tid = threadIdx.x, lane = tid % 64, w = tid / 64;
     const int r0 = 16*k;
-    double* s = a + 256*NB*k;
+    T* s = a + 256*NB*k;
 
-    double pv[NQ][16];
+    T pv[NQ][16];
 #pragma unroll
     for (int q = 0; q < NQ; q++)
     {
@@ -262,7 +258,7 @@ __device__ __noinline__ void factor_panel(
         {
             if (mq == q && mine == key)
             {
-                const double ipv = 1.0 / pv[q][j];
+                const T ipv = T(1) / pv[q][j];
 #pragma unroll
                 for (int c = 0; c < 16; c++)
                     cand[b][w][c] = c > j ? pv[q][c]*ipv : pv[q][c];
@@ -295,7 +291,7 @@ __device__ __noinline__ void factor_panel(
             ipiv[j] = mi;
 
         // Swap in the pivot row and eliminate the rows below
-        const double* pr = cand[b][wb];
+        const T* pr = cand[b][wb];
 #pragma unroll
         for (int q = 0; q < NQ; q++)
         {
@@ -314,7 +310,7 @@ __device__ __noinline__ void factor_panel(
                     for (int c = 0; c < 16; c++)
                         pv[q][c] = grow[b][c];
                 }
-                double lv = pv[q][j];
+                T lv = pv[q][j];
 #pragma unroll
                 for (int c = j + 1; c < 16; c++)
                     pv[q][c] -= lv*pr[c];
@@ -333,18 +329,18 @@ __device__ __noinline__ void factor_panel(
 
         for (int e = tid; e < 16*k; e += NL)
         {
-            double* sb = a + 256*NB*(e / 16);
+            T* sb = a + 256*NB*(e / 16);
             int c = e % 16;
-            int ig = 256*(gk / 16) + pk_ix(gk % 16, c);
-            int im = 256*(mi / 16) + pk_ix(mi % 16, c);
-            double t = sb[ig];
+            int ig = 256*(gk / 16) + pk_ix<T>(gk % 16, c);
+            int im = 256*(mi / 16) + pk_ix<T>(mi % 16, c);
+            T t = sb[ig];
             sb[ig] = sb[im];
             sb[im] = t;
         }
         for (int e = tid; e < 16*npend; e += NL)
         {
-            double* sb = a + 256*NB*(k + 1 + e / 16) + e % 16;
-            double t = sb[16*gk];
+            T* sb = a + 256*NB*(k + 1 + e / 16) + e % 16;
+            T t = sb[16*gk];
             sb[16*gk] = sb[16*mi];
             sb[16*mi] = t;
         }
@@ -372,7 +368,7 @@ __device__ __noinline__ void factor_panel(
         {
 #pragma unroll
             for (int c = 0; c < 16; c++)
-                s[256*(r / 16) + pk_ix(r % 16, c)] = pv[q][c];
+                s[256*(r / 16) + pk_ix<T>(r % 16, c)] = pv[q][c];
         }
     }
 }
@@ -390,9 +386,9 @@ __device__ __noinline__ void factor_panel(
 // then factorises its strips in turn, applying those of the pass before.
 //
 // The panel is spread over all the lanes too; see factor_panel.
-template<int NP, long long WSZ, int W, int S, typename IX>
+template<int NP, long long WSZ, int W, int S, typename T, typename IX>
 __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
-                                          double* __restrict__ ws_v,
+                                          T* __restrict__ ws_v,
                                           short* __restrict__ perm_v,
                                           unsigned long long* ticks)
 {
@@ -402,17 +398,17 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
     constexpr int NB = NP/16, NT = (NB + W - 1)/W, NL = 64*W;
 
     __shared__ short rord[NP];
-    __shared__ double dg[256], idg[16];
-    __shared__ f64x4 zb[2][S][64];
-    __shared__ double cand[2][W][16], grow[2][16];
+    __shared__ T dg[256], idg[16];
+    __shared__ vec4<T> zb[2][S][64];
+    __shared__ T cand[2][W][16], grow[2][16];
     __shared__ unsigned long long ckey[2][W];
     __shared__ int ipiv[16];
 
     const int tid = threadIdx.x, lane = tid % 64, w = tid / 64;
     const IX wk = wk_v[x];
-    double* a = ws_v + wk*WSZ;
-    double* uinv = a + pk_uinv<NB>(0);
-    const f64x4 zero = {0, 0, 0, 0};
+    T* a = ws_v + wk*WSZ;
+    T* uinv = a + pk_uinv<NB>(0);
+    const vec4<T> zero = {0, 0, 0, 0};
 
     // Start from the rows in their given order
     for (int r = tid; r < NP; r += NL)
@@ -425,14 +421,14 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
 
         // The nsa strips from kb held as tiles, with the updates solving
         // their block rows i0 to ke - 1
-        f64x4 z[S][NT];
+        vec4<T> z[S][NT];
         int kb, nsa, i0, ke;
         auto strip = [&](int s) { return a + 256*NB*(kb + s); };
         auto held = [&](int s) { return S == 1 || s < nsa; };
 
         // The operands of step i of the updates for the tiles, numbered
         // from block row jb, and of the solve of block row i + 1
-        f64x4 pa[NT], pd;
+        vec4<T> pa[NT], pd;
         auto fetch = [&](int i, int jb)
         {
 #pragma unroll
@@ -457,14 +453,14 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                 if (i >= ke)
                     break;
 
-                f64x4 zi[S];
+                vec4<T> zi[S];
 #pragma unroll
                 for (int s = 0; s < S; s++)
                     if (held(s))
                         zi[s] = zb[u % 2][s][lane];
                 const bool next = i + 1 < ke;
 
-                f64x4 ca[NT], cd = pd;
+                vec4<T> ca[NT], cd = pd;
 #pragma unroll
                 for (int t = 0; t < NT; t++)
                     ca[t] = pa[t];
@@ -480,14 +476,14 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                     {
                         if (held(s))
                         {
-                            f64x4 zn = mma_a<true>(ca[tn], zi[s], z[s][tn]);
+                            vec4<T> zn = mma_a<true>(ca[tn], zi[s], z[s][tn]);
                             zn = mma_a<false>(cd, zn, zero);
                             z[s][tn] = zn;
                             zb[(u + 1) % 2][s][lane] = zn;
 #pragma unroll
                             for (int v = 0; v < 4; v++)
                                 strip(s)[256*(i + 1)
-                                         + pk_ix(mfma_crow(lane, v),
+                                         + pk_ix<T>(mfma_crow<T>(lane, v),
                                                  mfma_lrow(lane))] = zn[v];
                         }
                     }
@@ -520,7 +516,7 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                 fetch(i0, i0);
                 if (w == 0)
                 {
-                    const f64x4 d = load_a(a + pk_block<NB>(i0, i0), lane);
+                    const vec4<T> d = load_a(a + pk_block<NB>(i0, i0), lane);
 #pragma unroll
                     for (int s = 0; s < S; s++)
                     {
@@ -531,7 +527,7 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
 #pragma unroll
                             for (int v = 0; v < 4; v++)
                                 strip(s)[256*i0
-                                         + pk_ix(mfma_crow(lane, v),
+                                         + pk_ix<T>(mfma_crow<T>(lane, v),
                                                  mfma_lrow(lane))] =
                                     z[s][0][v];
                         }
@@ -575,7 +571,7 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                     {
 #pragma unroll
                         for (int v = 0; v < 4; v++)
-                            strip(s)[256*j + 16*mfma_crow(lane, v)
+                            strip(s)[256*j + 16*mfma_crow<T>(lane, v)
                                      + mfma_lrow(lane)] = z[s][t][v];
                     }
                 }
@@ -598,7 +594,7 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
 #pragma unroll
                     for (int v = 0; v < 4; v++)
                     {
-                        int r = rord[16*j + mfma_crow(lane, v)];
+                        int r = rord[16*j + mfma_crow<T>(lane, v)];
                         z[s][t][v] = strip(s)[16*r + mfma_lrow(lane)];
                     }
                 }
@@ -628,7 +624,7 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
                     {
 #pragma unroll
                         for (int v = 0; v < 4; v++)
-                            z[0][t][v] = strip(0)[16*(16*j + mfma_crow(lane, v))
+                            z[0][t][v] = strip(0)[16*(16*j + mfma_crow<T>(lane, v))
                                                   + mfma_lrow(lane)];
                     }
                 }
@@ -637,14 +633,14 @@ __device__ __forceinline__ void lu_factor(IX x, const IX* __restrict__ wk_v,
 
             LUINV_TICK(2);
 
-            factor_panel<NP, W>(a, k, ns - 1 - s, rord, ipiv, cand, grow,
+            factor_panel<NP, W, T>(a, k, ns - 1 - s, rord, ipiv, cand, grow,
                                 ckey, dg);
             block_sync();
 
             LUINV_TICK(7);
 
             if (tid < 16)
-                idg[tid] = 1.0 / dg[17*tid];
+                idg[tid] = T(1) / dg[17*tid];
             __syncthreads();
 
             if (w < 2)

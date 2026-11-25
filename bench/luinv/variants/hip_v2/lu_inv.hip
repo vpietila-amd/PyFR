@@ -20,17 +20,22 @@ extern "C"
 }
 #endif
 
-// The hand written fp64 MFMA path: build, factorise a matrix per wave and
-// solve 16 columns per wave; see factor.hpp and solve.hpp
+// The hand written MFMA path: build, factorise a matrix per block and solve
+// 16 columns per wave, in LUINV_FTYPE (double or float) from Jacobians in
+// LUINV_STYPE to inverses in LUINV_OTYPE; see factor.hpp and solve.hpp
 #if defined(LUINV_MFMA)
 #include "luinv/hip_v2/common.hpp"
 #include "luinv/hip_v2/factor.hpp"
 
+typedef LUINV_FTYPE luinv_ftype;
+typedef LUINV_STYPE luinv_stype;
+typedef LUINV_OTYPE luinv_otype;
+
 extern "C" __global__ __launch_bounds__(256)
-void lu_build_hip_v2(ixdtype_t nx, double scale,
-                     const double* __restrict__ src_v, ixdtype_t ldsrc,
+void lu_build_hip_v2(ixdtype_t nx, LUINV_SCALE_T scale,
+                     const luinv_stype* __restrict__ src_v, ixdtype_t ldsrc,
                      const ixdtype_t* __restrict__ wk_v,
-                     double* __restrict__ ws_v)
+                     luinv_ftype* __restrict__ ws_v)
 {
     luinv::lu_build<LUINV_N, LUINV_NP, LUINV_WSZ>(
         ixdtype_t(LUINV_BLOCK_ID), nx, scale, src_v, ldsrc, wk_v, ws_v
@@ -39,20 +44,21 @@ void lu_build_hip_v2(ixdtype_t nx, double scale,
 
 extern "C" __global__ __launch_bounds__(256, LUINV_K1MB)
 void lu_factor_mfma_hip_v2(ixdtype_t _nx, const ixdtype_t* __restrict__ wk_v,
-                           double* __restrict__ ws_v,
+                           luinv_ftype* __restrict__ ws_v,
                            int16_t* __restrict__ perm_v,
                            unsigned long long* __restrict__ ticks)
 {
-    luinv::lu_factor<LUINV_NP, LUINV_WSZ, 4, LUINV_S>(ixdtype_t(LUINV_BLOCK_ID), wk_v,
-                                          ws_v, perm_v, ticks);
+    luinv::lu_factor<LUINV_NP, LUINV_WSZ, 4, LUINV_S>(
+        ixdtype_t(LUINV_BLOCK_ID), wk_v, ws_v, perm_v, ticks
+    );
 }
 
 extern "C" __global__ __launch_bounds__(64*LUINV_WPB, LUINV_K2MB)
-void lu_solve_mfma_hip_v2(ixdtype_t _nx, double* __restrict__ inv_v,
+void lu_solve_mfma_hip_v2(ixdtype_t _nx, luinv_otype* __restrict__ inv_v,
                           const ixdtype_t* __restrict__ inv_vix,
                           const int16_t* __restrict__ perm_v,
                           const ixdtype_t* __restrict__ wk_v,
-                          const double* __restrict__ ws_v)
+                          const luinv_ftype* __restrict__ ws_v)
 {
     luinv::lu_solve_mfma<LUINV_N, LUINV_NP, LUINV_WSZ, LUINV_WPB, LUINV_TR,
                          LUINV_TC, LUINV_PADC>(

@@ -1,10 +1,11 @@
 """The LU inverse in separate kernels for the factorisation and the solves.
 
-For fp64 the kernels are hand written with MFMA (see include/luinv/hip_v2):
-lu_build forms I - scale*src in a strip-major workspace, lu_factor_mfma
-factorises it left-looking with one wave per matrix, leaving the factor
-packed for the MFMA, and lu_solve_mfma solves for 16 columns of the inverse
-per wave.  The matrices are padded to a multiple of 16 for them.
+Where the factorisation is in fp64 or fp32 the kernels are hand written
+with MFMA (see include/luinv/hip_v2): lu_build forms I - scale*src in a
+strip-major workspace, lu_factor_mfma factorises it left-looking with a
+block of four waves per matrix, leaving the factor packed for the MFMA, and
+lu_solve_mfma solves for 16 columns of the inverse per wave.  The matrices
+are padded to a multiple of 16 for them.
 
 Otherwise both kernels come from the rendering of the frozen baseline
 template with the quick wins of hip_opt applied for the size, split at the
@@ -13,15 +14,14 @@ solves one column chunk of one matrix per block, each chunk with its own
 right-hand side area in the workspace.
 
 Options (environment variables, overriding the size policy):
-  LUINV_PATH=<path>   mfma (the default for fp64) or gen
-  LUINV_WPB=<n>       waves per block of the mfma solves
+  LUINV_PATH=<path>   mfma (the default) or gen
+  LUINV_WPB=<n>       waves per block of the mfma solves, which share
+                      their loads of the factor
   LUINV_K1_MINBLK=<n> launch bounds minimum blocks per CU of the mfma
                       factorisation
   LUINV_K2_MINBLK=<n> launch bounds minimum blocks per CU of the solves
   LUINV_NWORK=<n>     most matrices factorised at once on the mfma path
   LUINV_STRIPS=<n>    strips of 16 columns per pass of the factorisation
-  LUINV_SOLVE_SHARED=0|1  mfma solves sharing the loads of the factor
-                      between the waves of a block through LDS
   LUINV_MINBLK=<n>    the same as LUINV_K2_MINBLK for the generated
                       factorisation
   LUINV_PIVOT=<mode>  generated pivot arg-max: shfl (default) or lds
@@ -34,6 +34,8 @@ import os
 import re
 
 import numpy as np
+
+from pyfr.nputil import npdtype_to_ctype
 
 from bench.luinv.rawhip import PTR, RawHIPModule, hipcc_compatible
 from bench.luinv.variants.baseline import LUInverse as BaselineLUInverse
@@ -55,8 +57,13 @@ def nchunk(tplargs):
     return -(-tplargs['npad'] // tplargs['sc'])
 
 
+# C types of the hand written kernels for the storage types
+CTYPES = {'double': 'double', 'float': 'float', 'half': '_Float16',
+          'bf16': 'luinv::bf16'}
+
+
 def mfma_path(t):
-    return t['ftype'] == t['stype'] == t['otype'] == 'double'
+    return t['ftype'] in ('double', 'float')
 
 
 def options(tplargs):
@@ -66,20 +73,17 @@ def options(tplargs):
     path = env.get('LUINV_PATH', 'mfma' if mfma_path(t) else 'gen')
     if path == 'mfma':
         nb = t['npad'] // 16
-        shared = env.get('LUINV_SOLVE_SHARED', '1') not in ('', '0')
 
-        # Waves per block of the solves: sharing their loads, or splitting
-        # the column blocks evenly
-        wpb = 4 if shared else next(w for w in (4, 2, 1) if nb % w == 0)
-
-        # Two waves per SIMD while the tiles of Z fit in half the registers
+        # Blocks per CU as the registers allow, fp32 taking half as many,
+        # and two strips per pass of the factorisation for big matrices
+        small, f32 = nb <= 20, t['ftype'] == 'float'
+        k1minblk = (3 if small else 2) if f32 else (2 if small else 1)
         return {
             'path': path,
-            'wpb': int(env.get('LUINV_WPB', wpb)),
-            'k1minblk': int(env.get('LUINV_K1_MINBLK', 2 if nb <= 20 else 1)),
-            'shared': shared,
-            'strips': int(env.get('LUINV_STRIPS', 1 if nb <= 20 else 2)),
-            'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if nb <= 20 else 1))
+            'wpb': int(env.get('LUINV_WPB', 4)),
+            'k1minblk': int(env.get('LUINV_K1_MINBLK', k1minblk)),
+            'strips': int(env.get('LUINV_STRIPS', 1 if small else 2)),
+            'k2minblk': int(env.get('LUINV_K2_MINBLK', 2 if small else 1))
         }
 
     # Big matrices spill heavily at 2 blocks per CU
@@ -236,13 +240,14 @@ class LUInverse(BaselineLUInverse):
                 'LUINV_K1MB': opts['k1minblk'], 'LUINV_S': opts['strips'],
                 'LUINV_K2MB': opts['k2minblk'], 'LUINV_TR': out.trows,
                 'LUINV_TC': out.tcols, 'LUINV_PADC': out.padc,
-                'LUINV_NDIES': b.ndies,
+                'LUINV_NDIES': b.ndies, 'LUINV_FTYPE': t['ftype'],
+                'LUINV_STYPE': CTYPES[t['stype']],
+                'LUINV_OTYPE': CTYPES[t['otype']],
+                'LUINV_SCALE_T': npdtype_to_ctype(b.fpdtype),
                 'LUINV_IXTYPE': {4: 'int', 8: 'int64_t'}[
                     np.dtype(b.ixdtype).itemsize
                 ]
             }
-            if opts['shared']:
-                defs['LUINV_SOLVE_SHARED'] = 1
             if os.environ.get('LUINV_PHASES'):
                 defs['LUINV_PHASES'] = 1
         else:

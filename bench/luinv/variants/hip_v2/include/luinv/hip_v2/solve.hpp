@@ -1,31 +1,27 @@
-// Inverse of a matrix from its LU factorisation with fp64 MFMA.
+// Inverse of a matrix from its LU factorisation with MFMA, in fp64 or fp32.
 //
-// The factorisation leaves P A = L U in the workspace, as an NP x NP row
-// major matrix with the lower L on and below the diagonal and the unit
-// upper U above it, and the row order P in perm.  The inverse is
-// A^-1 = U^-1 L^-1 P, so with Z = U^-1 L^-1 solving L U Z = I column by
-// column, column k of Z is column perm[k] of A^-1.
+// The factorisation leaves P A = L U with L lower and U unit upper, and the
+// row order P in perm.  The inverse is A^-1 = U^-1 L^-1 P, so with
+// Z = U^-1 L^-1 solving L U Z = I column by column, column k of Z is column
+// perm[k] of A^-1.
 //
 // The factor comes packed from lu_factor in factor.hpp: NB x NB blocks of
 // 16 x 16 (NB = NP/16), stored a strip of 16 columns at a time, each block
-// in the order of the A operand of the MFMA so a wave loads it as 2 KB in a
-// row; the inverses of the diagonal blocks of L are in place of them, and
+// in the order of the A operands of the MFMA so a wave loads it in one
+// piece; the inverses of the diagonal blocks of L are in place of them, and
 // those of U come after all the blocks.
 //
-// lu_solve_mfma has every wave solve for 16 columns of Z on its own,
-// holding them in registers as NB accumulator tiles of 16 x 16; nothing is
-// shared between waves, so there is no LDS and no barrier.  Each block row
-// i of a triangular solve is one product with the inverse of the diagonal
-// block, D_ii^-1 Z_i, then the updates Z_j -= M_ji Z_i of the block rows
-// still to be solved.
-//
-// In the accumulator layout of v_mfma_f64_16x16x4_f64 lane l holds
-// Z[l/16 + 4v][l%16] for v = 0..3, which is exactly the B operand of the
-// 4-deep slice v of a product with Z, so a solved tile feeds the updates
-// straight from its registers.
+// lu_solve_mfma has every wave solve for 16 columns of Z, holding them in
+// registers as NB accumulator tiles of 16 x 16.  Each block row i of a
+// triangular solve is one product with the inverse of the diagonal block,
+// D_ii^-1 Z_i, then the updates Z_j -= M_ji Z_i of the block rows still to
+// be solved, with Z_i the B operand straight from its accumulators (see
+// mfma.hpp).  The waves of a block share the loads of the factor through
+// LDS.
 #pragma once
 
 #include "luinv/hip_v2/mfma.hpp"
+#include "luinv/hip_v2/types.hpp"
 
 namespace luinv
 {
@@ -38,96 +34,49 @@ __device__ __forceinline__ int pk_block(int j, int i) { return 256*(NB*i + j); }
 template<int NB>
 __device__ __forceinline__ int pk_uinv(int i) { return 256*(NB*NB + i); }
 
-// Position in a packed block of element (r, c): the lane holding it and
-// the slice of the A operand it is in
+// Position in a packed block of element (r, c): the lane holding it as an
+// A operand and the slice of the product it is in, such that slice v takes
+// the rows of Z in accumulator value v
+template<typename T>
 __device__ __forceinline__ int pk_ix(int r, int c)
 {
-    return 4*(r + 16*(c % 4)) + c / 4;
+    if constexpr (sizeof(T) == 8)
+        return 4*(r + 16*(c % 4)) + c / 4;
+    else
+        return 4*(r + 16*(c / 4)) + c % 4;
 }
 
 // The A operands the lane holds of the packed 16 x 16 block at m
-__device__ __forceinline__ f64x4 load_a(const double* m, int lane)
+template<typename T>
+__device__ __forceinline__ vec4<T> load_a(const T* m, int lane)
 {
-    return *reinterpret_cast<const f64x4*>(m + 4*lane);
+    return *reinterpret_cast<const vec4<T>*>(m + 4*lane);
 }
 
 // acc +/- M . Z for the block M whose A operands are a
-template<bool Neg>
-__device__ __forceinline__ f64x4 mma_a(f64x4 a, f64x4 z, f64x4 acc)
+template<bool Neg, typename T>
+__device__ __forceinline__ vec4<T> mma_a(vec4<T> a, vec4<T> z, vec4<T> acc)
 {
 #pragma unroll
     for (int s = 0; s < 4; s++)
-        acc = mfma_f64_16x16x4(Neg ? -a[s] : a[s], z[s], acc);
+        acc = mfma_16x16x4(Neg ? -a[s] : a[s], z[s], acc);
 
     return acc;
 }
 
-// acc +/- M . Z for the packed 16 x 16 block M at m
-template<bool Neg>
-__device__ __forceinline__ f64x4 block_mma(const double* m, int lane,
-                                           f64x4 z, f64x4 acc)
-{
-    return mma_a<Neg>(load_a(m, lane), z, acc);
-}
-
-// Solve L U Z = I for the 16 columns of Z from column block cb, given the
-// packed factor pk
-template<int NB>
-__device__ __forceinline__ void solve_columns(const double* pk, int cb,
-                                              int lane, f64x4 (&z)[NB])
-{
-    const f64x4 zero = {0, 0, 0, 0};
-
-    // Start from the columns of the identity
-#pragma unroll
-    for (int j = 0; j < NB; j++)
-    {
-#pragma unroll
-        for (int v = 0; v < 4; v++)
-            z[j][v] = (j == cb && mfma_crow(lane, v) == mfma_lrow(lane));
-    }
-
-    // Forward: L^-1 is lower triangular so the block rows above cb stay zero
-#pragma unroll
-    for (int i = 0; i < NB; i++)
-    {
-        if (i < cb)
-            continue;
-
-        z[i] = block_mma<false>(pk + pk_block<NB>(i, i), lane, z[i], zero);
-
-#pragma unroll
-        for (int j = i + 1; j < NB; j++)
-            z[j] = block_mma<true>(pk + pk_block<NB>(j, i), lane, z[i], z[j]);
-    }
-
-    // Backward
-#pragma unroll
-    for (int i = NB - 1; i >= 0; i--)
-    {
-        z[i] = block_mma<false>(pk + pk_uinv<NB>(i), lane, z[i], zero);
-
-#pragma unroll
-        for (int j = 0; j < i; j++)
-            z[j] = block_mma<true>(pk + pk_block<NB>(j, i), lane, z[i], z[j]);
-    }
-}
-
-// The same for the WPB waves of a block, each from column block cb0 + w,
-// sharing the loads of the factor through LDS.  A sweep goes a column of
-// blocks of the factor at a time, the inverse of the diagonal block first,
-// in chunks of WPB blocks; each wave fetches one block of the next chunk
+// Solve L U Z = I for the 16 columns of Z from column block cb0 + w of each
+// of the WPB waves of a block.  A sweep goes a column of blocks of the
+// factor at a time, the inverse of the diagonal block first, in chunks of
+// WPB blocks staged in LDS; each wave fetches one block of the next chunk
 // while the current one is applied, so each chunk takes one barrier.
-template<int NB, int WPB>
-__device__ __forceinline__ void solve_columns_shared(const double* pk,
-                                                     int cb0, int w,
-                                                     int lane,
-                                                     f64x4 (&z)[NB])
+template<int NB, int WPB, typename T>
+__device__ __forceinline__ void solve_columns(const T* pk, int cb0, int w,
+                                              int lane, vec4<T> (&z)[NB])
 {
-    __shared__ f64x4 st[2][WPB][64];
+    __shared__ vec4<T> st[2][WPB][64];
 
     const int cb = cb0 + w;
-    const f64x4 zero = {0, 0, 0, 0};
+    const vec4<T> zero = {0, 0, 0, 0};
 
     // Start from the columns of the identity
 #pragma unroll
@@ -135,7 +84,7 @@ __device__ __forceinline__ void solve_columns_shared(const double* pk,
     {
 #pragma unroll
         for (int v = 0; v < 4; v++)
-            z[j][v] = (j == cb && mfma_crow(lane, v) == mfma_lrow(lane));
+            z[j][v] = (j == cb && mfma_crow<T>(lane, v) == mfma_lrow(lane));
     }
 
     // Block m of column i of the forward or backward sweep, and their count
@@ -148,7 +97,7 @@ __device__ __forceinline__ void solve_columns_shared(const double* pk,
     };
     auto count = [](bool fwd, int i) { return fwd ? NB - i : i + 1; };
 
-    f64x4 pf;
+    vec4<T> pf;
     auto fetch = [&](bool fwd, int i, int c)
     {
         int m = WPB*c + w;
@@ -184,7 +133,7 @@ __device__ __forceinline__ void solve_columns_shared(const double* pk,
                 if (m >= count(fwd, i))
                     break;
 
-                const f64x4 a = st[buf][u][lane];
+                const vec4<T> a = st[buf][u][lane];
                 if (m == 0)
                     z[i] = mma_a<false>(a, z[i], zero);
                 else if (fwd)
@@ -227,31 +176,26 @@ __device__ __forceinline__ int tiled_ix(int r, int c)
 }
 
 // One block of WPB waves per WPB*16 columns of one matrix, the last block
-// of a matrix with fewer columns than that
+// of a matrix with fewer columns than that; the inverse is written as OT
 template<int N, int NP, long long WSZ, int WPB, int TR, int TC, int PADC,
-         typename IX>
+         typename T, typename OT, typename IX>
 __device__ __forceinline__ void lu_solve_mfma(
-    IX b, double* __restrict__ inv_v, const IX* __restrict__ inv_vix,
+    IX b, OT* __restrict__ inv_v, const IX* __restrict__ inv_vix,
     const short* __restrict__ perm_v, const IX* __restrict__ wk_v,
-    const double* __restrict__ ws_v)
+    const T* __restrict__ ws_v)
 {
     constexpr int NB = NP/16, BPM = (NB + WPB - 1)/WPB;
 
-    const int lane = threadIdx.x % 64;
+    const int lane = threadIdx.x % 64, w = threadIdx.x / 64;
     const IX x = b / BPM;
-    const int cb = int(b % BPM)*WPB + threadIdx.x / 64;
+    const int cb0 = int(b % BPM)*WPB, cb = cb0 + w;
 
     const IX wk = wk_v[x];
-    const double* pk = ws_v + wk*WSZ;
+    const T* pk = ws_v + wk*WSZ;
     const short* perm = perm_v + wk*NP;
 
-    f64x4 z[NB];
-#if defined(LUINV_SOLVE_SHARED)
-    solve_columns_shared<NB, WPB>(pk, cb - threadIdx.x / 64, threadIdx.x / 64,
-                                  lane, z);
-#else
-    solve_columns<NB>(pk, cb, lane, z);
-#endif
+    vec4<T> z[NB];
+    solve_columns<NB, WPB>(pk, cb0, w, lane, z);
 
     // Write the columns out in pivoted order, with the waves of the last
     // block past the end only having helped with the loads
@@ -261,7 +205,7 @@ __device__ __forceinline__ void lu_solve_mfma(
     const int gcol = perm[16*cb + mfma_lrow(lane)];
     if (gcol < N)
     {
-        double* inv = inv_v + inv_vix[x];
+        OT* inv = inv_v + inv_vix[x];
 
 #pragma unroll
         for (int j = 0; j < NB; j++)
@@ -269,9 +213,9 @@ __device__ __forceinline__ void lu_solve_mfma(
 #pragma unroll
             for (int v = 0; v < 4; v++)
             {
-                int r = 16*j + mfma_crow(lane, v);
+                int r = 16*j + mfma_crow<T>(lane, v);
                 if (r < N)
-                    inv[tiled_ix<TR, TC, PADC>(r, gcol)] = z[j][v];
+                    inv[tiled_ix<TR, TC, PADC>(r, gcol)] = cvt<OT>(z[j][v]);
             }
         }
     }
