@@ -9,8 +9,9 @@ factorisation is in fp64 for double and in fp32 for the other precisions.
 
 The kernels are C++ templates over their configuration (config.hpp): the
 problem, which this passes as -D macros, and the tuning knobs, which the
-policy there picks for the size and precision.  The environment can
-override the knobs:
+policy there picks for the size and precision.  The launch bounds of the
+factorisation and the solves carry their block sizes, which this reads back
+to size their launches.  The environment can override the knobs:
   LUINV_K1_WAVES=<n>  waves per block of the factorisation, 4 or 8
   LUINV_STRIPS=<n>    strips of 16 columns per pass of the factorisation
   LUINV_K1_MINBLK=<n> launch bounds of the factorisation: the minimum waves
@@ -41,7 +42,7 @@ HERE = Path(__file__).parent
 INCLUDE = HERE / 'include'
 
 BUILD, FACTOR = 'lu_build_hip_v2', 'lu_factor_mfma_hip_v2'
-SOLVE, CONFIG = 'lu_solve_mfma_hip_v2', 'lu_inv_config_hip_v2'
+SOLVE = 'lu_solve_mfma_hip_v2'
 
 # C types of the storage types
 CTYPES = {'double': 'double', 'float': 'float', 'half': '_Float16',
@@ -51,10 +52,6 @@ CTYPES = {'double': 'double', 'float': 'float', 'half': '_Float16',
 KNOBS = {'LUINV_K1_WAVES': 'LUINV_K1W', 'LUINV_STRIPS': 'LUINV_S',
          'LUINV_K1_MINBLK': 'LUINV_K1MB', 'LUINV_INV_OOL': 'LUINV_IOL',
          'LUINV_WPB': 'LUINV_WPB', 'LUINV_K2_MINBLK': 'LUINV_K2MB'}
-
-# The configuration lu_inv_config_hip_v2 reports, in order
-CONFIG_KEYS = ('npad', 'wsz', 'k1w', 'strips', 'k1minblk', 'iol', 'wpb',
-               'k2minblk')
 
 
 class LUInverse(BaselineLUInverse):
@@ -122,30 +119,16 @@ class LUInverse(BaselineLUInverse):
         return RawHIPModule(b, HERE / 'lu_inv.hip', INCLUDE, defines=defs)
 
     @cached_property
-    def opts(self):
-        """The configuration the kernels took, which they report."""
-        b, t = self.backend, self.tplargs
-
-        buf = b.hip.mem_alloc(8*len(CONFIG_KEYS))
-        k = self.module.kernel(CONFIG, [PTR], (1, 1, 1), (64, 1, 1))
-        k.set_args(buf)
-        b.run_kernels([k])
-        b.wait()
-
-        vals = np.zeros(len(CONFIG_KEYS), dtype=np.int64)
-        b.hip.memcpy(vals, buf, vals.nbytes)
-        opts = dict(zip(CONFIG_KEYS, map(int, vals)))
-
-        # The workspace is sized from the same layout
-        if (opts['npad'], opts['wsz']) != (t['npad'], t['wsz']):
-            raise RuntimeError('Workspace layout differs from the kernels')
-
-        return opts
+    def waves(self):
+        """Waves per block of the factorisation and the solves, from the
+        launch bounds the kernels took."""
+        return tuple(self.module.get_function(k, []).max_threads // 64
+                     for k in (FACTOR, SOLVE))
 
     @cached_property
     def kerns(self):
-        b, t, mod, opts = self.backend, self.tplargs, self.module, self.opts
-        nb, wpb, k1w = t['npad'] // 16, opts['wpb'], opts['k1w']
+        b, t, mod = self.backend, self.tplargs, self.module
+        nb, (k1w, wpb) = t['npad'] // 16, self.waves
         sizes = {v.n for ps in self.parts.values() for _, v in ps}
 
         # The kernels for each number of items inverted at once

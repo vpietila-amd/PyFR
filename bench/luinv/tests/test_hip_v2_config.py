@@ -3,47 +3,40 @@ import pytest
 from bench.luinv.harness import Case, build
 
 
-# The knobs config.hpp picks: (n, precision, matrices) -> (K1W, S, K1MB,
-# IOL, WPB, K2MB), as documented there; 65 matrices make a launch of few
+# The waves per block config.hpp picks for the factorisation and the solves,
+# which the launches take from the kernels: (n, precision) -> (K1W, WPB),
+# either side of where the policy changes them
 POLICY = [
-    (70, 'double', 65, (4, 1, 2, 0, 2, 2)),
-    (70, 'double', 1500, (4, 1, 4, 1, 2, 2)),
-    (175, 'double', 1500, (4, 1, 2, 1, 4, 2)),
-    (320, 'double', 1500, (4, 1, 2, 0, 4, 2)),
-    (400, 'double', 65, (4, 1, 2, 0, 4, 1)),
-    (500, 'double', 65, (8, 2, 1, 0, 4, 1)),
-    (70, 'single', 65, (4, 1, 4, 1, 2, 2)),
-    (200, 'single', 65, (4, 1, 3, 1, 4, 2)),
-    (320, 'half', 65, (4, 2, 3, 1, 4, 2)),
-    (400, 'bf16', 65, (4, 1, 3, 1, 4, 1)),
-    (500, 'single', 65, (4, 2, 2, 1, 4, 1)),
-    (625, 'single', 65, (8, 2, 1, 0, 4, 1)),
+    (70, 'double', (4, 2)),
+    (96, 'double', (4, 2)),
+    (97, 'double', (4, 4)),
+    (416, 'double', (4, 4)),
+    (417, 'double', (8, 4)),
+    (70, 'single', (4, 2)),
+    (512, 'single', (4, 4)),
+    (513, 'single', (8, 4)),
+    (320, 'half', (4, 4)),
+    (625, 'bf16', (8, 4)),
 ]
 
-KEYS = ('k1w', 'strips', 'k1minblk', 'iol', 'wpb', 'k2minblk')
 
-
-def _opts(variant, backend_name, n, prec, neles):
+def _waves(variant, backend_name, n, prec):
     if variant != 'hip_v2':
         pytest.skip('hip_v2 only')
 
-    case = Case(n=n, neles=neles, precision=prec, variant=variant,
+    case = Case(n=n, neles=65, precision=prec, variant=variant,
                 backend=backend_name)
-    return build(case).impl.opts
+    return build(case).impl.waves
 
 
-@pytest.mark.parametrize('n,prec,neles,knobs', POLICY)
-def test_policy(variant, backend_name, n, prec, neles, knobs):
-    opts = _opts(variant, backend_name, n, prec, neles)
-
-    assert opts['npad'] == -(-n // 16)*16
-    assert tuple(opts[k] for k in KEYS) == knobs
+@pytest.mark.parametrize('n,prec,waves', POLICY)
+def test_policy(variant, backend_name, n, prec, waves):
+    assert _waves(variant, backend_name, n, prec) == waves
 
 
 def test_override(variant, backend_name, monkeypatch):
     monkeypatch.setenv('LUINV_K1_WAVES', '8')
     monkeypatch.setenv('LUINV_STRIPS', '2')
     monkeypatch.setenv('LUINV_WPB', '4')
-    opts = _opts(variant, backend_name, 70, 'double', 65)
 
-    assert (opts['k1w'], opts['strips'], opts['wpb']) == (8, 2, 4)
+    assert _waves(variant, backend_name, 70, 'double') == (8, 4)

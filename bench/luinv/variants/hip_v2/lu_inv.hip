@@ -17,8 +17,9 @@
 //   LUINV_FEW      1 for launches of at most three matrices per CU
 // and may override the tuning knobs of the policy with LUINV_K1W, LUINV_S,
 // LUINV_K1MB, LUINV_IOL, LUINV_WPB and LUINV_K2MB, or count the cycles of
-// the phases of the factorisation with LUINV_PHASES.  lu_inv_config_hip_v2
-// reports the configuration taken.
+// the phases of the factorisation with LUINV_PHASES.  The launch bounds of
+// the factorisation and the solves carry their block sizes, from which the
+// caller sizes their launches.
 
 #if !defined(__HIPCC_RTC__)
 #include <hip/hip_runtime.h>
@@ -96,14 +97,3 @@ void lu_solve_mfma_hip_v2(ix_t _nx, cfg::OT* __restrict__ inv_v,
                               inv_vix, perm_v, wk_v, ws_v);
 }
 
-// The configuration taken, for the caller to size the workspace and launch
-// the kernels: NP, WSZ, K1W, S, K1MB, IOL, WPB, K2MB
-extern "C" __global__ void lu_inv_config_hip_v2(long long* out)
-{
-    if (threadIdx.x == 0)
-    {
-        out[0] = cfg::NP, out[1] = cfg::WSZ, out[2] = cfg::K1W;
-        out[3] = cfg::S, out[4] = cfg::K1MB, out[5] = cfg::IOL;
-        out[6] = cfg::WPB, out[7] = cfg::K2MB;
-    }
-}
